@@ -4,3 +4,4 @@ __pycache__/
 .env
 *.part
 .DS_Store
+models/
