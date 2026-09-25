@@ -50,6 +50,107 @@ The installer:
 4. downloads the **Qwen-Image-2.1-specific VAE**;
 5. copies the bundled text-to-image and image-edit workflows into ComfyUI.
 
+## Standalone API (no ComfyUI) — Windows setup
+
+Run Qwen-Image-2.1 image editing behind a plain HTTP API (`image + text prompt → edited image`) without launching ComfyUI. Uses the same Q4_K GGUF weights as the ComfyUI workflows, with a bitsandbytes 4-bit text encoder and CPU offload, targeting an 8GB NVIDIA GPU.
+
+### Requirements
+
+- Windows 10/11 (64-bit)
+- NVIDIA GPU, 8GB VRAM target profile (recent NVIDIA driver installed)
+- ~32GB system RAM recommended (components offload to CPU)
+- ~30GB free disk (GGUF ~5GB + text encoder ~17GB + cache)
+- [Git](https://git-scm.com/download/win)
+- [Python 3.12 (64-bit)](https://www.python.org/downloads/) — check **"Add python.exe to PATH"** during install
+
+> No CUDA toolkit install needed: the CUDA runtime ships inside the PyTorch wheels.
+
+### 1. Clone and create a virtual environment
+
+```powershell
+git clone https://github.com/a7md-ashrf/qwen-image-2.1-8gb
+cd qwen-image-2.1-8gb
+
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+If PowerShell blocks activation, run once:
+
+```powershell
+Set-ExecutionPolicy -Scope Process RemoteSigned
+```
+
+### 2. Install dependencies
+
+```powershell
+pip install -r requirements-api.txt
+```
+
+This pulls the CUDA build of PyTorch, diffusers (from git, day-0 Qwen-Image-2.1 support), transformers, bitsandbytes, and FastAPI.
+
+### 3. Start the service
+
+```powershell
+python api.py --host 0.0.0.0 --port 8000
+```
+
+First boot downloads:
+
+- `models\qwen_image_2.1-Q4_K.gguf` (~5GB) — the quantized DiT
+- the official Qwen3-VL text encoder + VAE into the Hugging Face cache (~17GB)
+
+Wait for `Ready.` — the model is loaded and warmed up at this point.
+
+**Already have the GGUF from a ComfyUI install?** Skip the download:
+
+```powershell
+python api.py --gguf "D:\ComfyUI_windows_portable\ComfyUI\models\diffusion_models\qwen_image_2.1-Q4_K.gguf"
+```
+
+### 4. Allow network access
+
+Windows Firewall will prompt when the port binds — allow it on private networks, or pre-approve:
+
+```powershell
+netsh advfirewall firewall add rule name="Qwen Image API" dir=in action=allow protocol=TCP localport=8000
+```
+
+### 5. Call the API
+
+Health check:
+
+```powershell
+curl.exe http://localhost:8000/health
+```
+
+Edit an image (use `curl.exe`, not `curl` — PowerShell aliases `curl` to `Invoke-WebRequest`):
+
+```powershell
+curl.exe -F "image=@input.png" -F "prompt=Change the background to a sunset" http://localhost:8000/edit -o output.png
+```
+
+Optional form fields: `steps` (default 25), `seed`, `width`/`height` (default 1024×1024), `guidance_scale` (default 1.0 = no CFG), `negative_prompt`. The response includes `X-Seed`, `X-Width`, `X-Height` headers so you can reuse the seed.
+
+Stop the service with `Ctrl+C`.
+
+### Useful flags
+
+| Flag | Purpose |
+|---|---|
+| `--host` / `--port` | Bind address (default `0.0.0.0:8000`) |
+| `--gguf PATH` | Use an existing GGUF file instead of downloading |
+| `--bf16-transformer` | Fallback if the GGUF fails to load (Comfy-Org bf16, tighter on 8GB) |
+| `--dtype {auto,bf16,fp16}` | Auto picks fp16 on Turing (RTX 20xx), bf16 on Ampere+ |
+| `--no-warmup` | Bind immediately; model loads on first request |
+| `--no-download` | Fail instead of downloading missing GGUF weights |
+
+### Troubleshooting
+
+- **OOM during warmup** — lower resolution (`width`/`height` 768), close other VRAM users, keep only this model loaded.
+- **GGUF load error** — retry with `--bf16-transformer`.
+- **CUDA not available** — check `nvidia-smi` works and the driver is current; a CPU-only torch install will fail with "CUDA GPU is required".
+
 ## Check before downloading
 
 ```bash
