@@ -1,6 +1,15 @@
 __pycache__/
+.ruff_cache/
 *.py[cod]
+*.egg-info/
 .venv/
 .env
 *.part
 .DS_Store
+
+# Everything this tool creates at runtime
+runtime/
+!runtime/.gitkeep
+
+# The ComfyUI submodule keeps its own .gitignore (models/, output/, input/,
+# custom_nodes/ and user/ are ignored by ComfyUI itself).

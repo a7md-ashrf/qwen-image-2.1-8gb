@@ -1,0 +1,7 @@
+# Runtime dependencies for the API service (`qwen21 install` creates a venv
+# for these; the service itself needs nothing else).
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+python-multipart>=0.0.9
+pydantic>=2.7

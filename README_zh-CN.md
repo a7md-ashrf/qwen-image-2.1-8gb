@@ -1,338 +1,156 @@
-# Qwen-Image-2.1 8GB 显存运行方案
+# Qwen-Image-2.1 在 8GB 显存上运行 — 安装、对外提供接口
 
-**让 Qwen-Image-2.1 在 8GB NVIDIA 显卡上跑起来：ComfyUI + GGUF + 一键安装。**
+在 8GB 显卡 **或** 8GB 内存的 Apple Silicon Mac 上运行 Qwen-Image-2.1（7B，Apache-2.0），
+并对外暴露一个 **公网 HTTP 接口**：上传图片 + 一句文本指令，返回改好的图片。
 
-这个项目专门解决一个很实际的问题：
+一条命令装好全部内容：ComfyUI（以 git 子模块固定版本）、对应硬件的 torch、GGUF 模型栈、
+FastAPI 服务、Cloudflare 隧道。不需要手动下载任何文件。
 
-> **只有 8GB 显存，也想本地跑 Qwen-Image-2.1。**
-
-项目提供：
-
-- 一键安装低显存依赖
-- 自动检测显卡与模型文件
-- 自动安装 ComfyUI-GGUF
-- 自动下载 Q4 GGUF、W4A8 文本编码器和 Qwen-Image-2.1 专用 VAE
-- 文生图工作流
-- 图片编辑工作流
-- 低显存启动模式
-- Windows / Linux 安装脚本
-
-> 当前开发环境已在 **RTX 2080 SUPER 8GB** 上验证模型文件与工作流配置。
-
----
-
-## 为什么做这个项目
-
-Qwen-Image-2.1 是一个非常新的开源图像模型，生成、编辑、文字渲染、多图参考等能力都很强。
-
-问题是：
-
-**原始模型对显存要求并不友好。**
-
-很多 8GB 显卡用户看到模型体积后，会直接认为：
-
-> “这玩意 8GB 肯定跑不了。”
-
-实际上，通过：
-
-- GGUF 量化
-- Q4 扩散模型
-- W4A8 文本编码器
-- ComfyUI CPU offload
-- \`--lowvram\`
-
-可以把显存压力显著降低。
-
-需要注意：
-
-> **“支持 8GB 显存”不等于所有模型权重加起来只有 8GB。**
-
-部分权重会在内存和显存之间动态加载，因此建议系统内存至少 **32GB**。
-
----
-
-# 30 秒安装
-
-## Windows
-
-首先准备：
-
-- NVIDIA 显卡
-- ComfyUI
-- Git
-- Python
-
-然后：
-
-\`\`\`powershell
-git clone https://github.com/toyhank/qwen-image-2.1-8gb
+```bash
+git clone --recurse-submodules https://github.com/toyhank/qwen-image-2.1-8gb
 cd qwen-image-2.1-8gb
+./install.sh                 # Windows: .\install.ps1
+qwen21 start                 # ComfyUI + API + 公网隧道
+```
 
-.\install.ps1 -ComfyUI "D:\ComfyUI_windows_portable\ComfyUI"
-\`\`\`
+```
+ComfyUI   http://127.0.0.1:8188
+API       http://127.0.0.1:8000  （交互式文档在 /docs）
+公网      https://<随机串>.trycloudflare.com/v1/edit
+```
 
-例如你的 ComfyUI 在：
+在任何地方调用：
 
-\`\`\`text
-G:\AI\image\ComfyUI_windows_portable\ComfyUI
-\`\`\`
+```bash
+curl -X POST https://<隧道>/v1/edit \
+  -H "Authorization: Bearer $API_KEY" \
+  -F "image=@before.png" \
+  -F "prompt=把杯子上的字改成 'ROASTED IN TOKYO'，保持原来的墨迹质感"
+```
 
-那么执行：
+返回 JSON，里面是 base64 的 PNG 和一个下载地址。完整接口说明见
+[docs/API.md](docs/API.md)。
 
-\`\`\`powershell
-.\install.ps1 -ComfyUI "G:\AI\image\ComfyUI_windows_portable\ComfyUI"
-\`\`\`
+## 一条命令做了什么
 
----
+`qwen21 install`（`install.sh` / `install.ps1` 负责引导）：
 
-## Linux
+1. 初始化 **ComfyUI 子模块**，固定在 `v0.37.0`——第一个自带 `TextEncodeQwenImage21`
+   和 `QwenImage21Cache` 的稳定版本；
+2. 建立虚拟环境并安装适合你硬件的 torch；
+3. 安装 `city96/ComfyUI-GGUF` **以及它的 `gguf` 依赖**（只装节点不装依赖，
+   加载模型时照样报错）；
+4. 按配置档下载模型（支持断点续传与体积校验）；
+5. 把内置工作流复制进 ComfyUI；
+6. 建立 API 虚拟环境并安装 `api/requirements.txt`；
+7. 根据 `.env.example` 生成 `.env`。
 
-\`\`\`bash
-git clone https://github.com/toyhank/qwen-image-2.1-8gb
-cd qwen-image-2.1-8gb
+最后自动执行 `doctor`，告诉你还差什么。
 
-./install.sh /path/to/ComfyUI
-\`\`\`
+## 硬件配置档
 
----
+| 配置档 | 机器 | 扩散模型 | 文本编码器 | 默认 |
+|---|---|---|---|---|
+| `nvidia-8gb` | RTX 4060 8GB、2080 SUPER、3060 | `qwen_image_2.1-Q4_K.gguf`（4.2 GB） | `qwen3vl_8b_w4a8`（6.3 GB，固定在 CPU） | 1024px，25 步 |
+| `mac-8gb` | MacBook Air M3 8GB | `qwen_image_2.1-Q3_K.gguf`（3.3 GB） | `qwen3vl_8b_w4a8` | 768px，20 步 |
+| `mac-8gb-lite` | 内存吃紧的 8GB | `Q2_K`（2.6 GB） | `qwen3vl_8b_w4a8` | 640px，16 步 |
+| `full` | 12GB+ 显存 / 16GB+ 统一内存 | `qwen_image_2.1_int8_convrot.safetensors` | `qwen3vl_8b_int8_convrot` | 1328px，25 步 |
 
-# 安装器会做什么
+默认 `auto` 会根据 `nvidia-smi` / `sysctl hw.memsize` 自动选择，也可以用
+`--profile` 指定。
 
-安装脚本会自动完成：
+为什么用 GGUF 而不是官方 int8：官方模板需要 7.3 GB 的 transformer **和** 9.4 GB 的
+编码器同时在内存里，8GB 机器都做不到。Q4 GGUF（4.2 GB）加 4bit 编码器（6.3 GB，
+跑在 CPU 上）可以装下，ComfyUI 自己的动态显存管理负责在采样前后搬进搬出。
+详见 [docs/HARDWARE.md](docs/HARDWARE.md)。
 
-1. 安装或更新 \`ComfyUI-GGUF\`
-2. 下载 Qwen-Image-2.1 Q4 GGUF
-3. 下载 Qwen3-VL W4A8 文本编码器
-4. 下载 Qwen-Image-2.1 专用 VAE
-5. 将工作流复制到 ComfyUI
+## 命令一览
 
-不会把模型直接打包进本项目。
-
-所有模型仍然从 Hugging Face 上游仓库下载。
-
----
-
-# 先检测环境
-
-如果你已经装过一部分模型，建议先运行：
-
-\`\`\`bash
-python qwen21.py doctor --comfy /path/to/ComfyUI
-\`\`\`
-
-Windows 示例：
-
-\`\`\`powershell
-python qwen21.py doctor --comfy "G:\AI\image\ComfyUI_windows_portable\ComfyUI"
-\`\`\`
-
-正常情况下会看到类似输出：
-
-\`\`\`text
-Qwen-Image-2.1 8GB doctor
-=================================
-GPU: NVIDIA GeForce RTX 2080 SUPER — 8.0 GiB VRAM
-
-OK: ComfyUI-GGUF
-OK: compatible GGUF found: qwen_image_2.1_Q4_K_M.gguf
-OK: qwen3vl_8b_w4a8.safetensors
-OK: qwen_image_2.1_vae_bf16.safetensors
-
-Ready.
-\`\`\`
-
----
-
-# 模型文件
-
-默认低显存方案：
-
-| 类型 | 文件 |
+| 命令 | 作用 |
 |---|---|
-| 扩散模型 | \`qwen_image_2.1-Q4_K.gguf\` |
-| 文本编码器 | \`qwen3vl_8b_w4a8.safetensors\` |
-| VAE | \`qwen_image_2.1_vae_bf16.safetensors\` |
-
-其中最重要的一点：
-
-## Qwen-Image-2.1 必须使用 2.1 专用 VAE
-
-也就是：
-
-\`\`\`text
-qwen_image_2.1_vae_bf16.safetensors
-\`\`\`
-
-不要直接拿旧版 Qwen-Image VAE 替代。
-
----
-
-# ComfyUI 工作流
-
-项目内已经包含两个工作流：
-
-### 文生图
-
-\`\`\`text
-workflows/qwen-image-2.1-8gb-t2i.json
-\`\`\`
-
-### 图片编辑
-
-\`\`\`text
-workflows/qwen-image-2.1-8gb-edit.json
-\`\`\`
-
-可以直接把 JSON 文件拖进 ComfyUI。
-
-也可以自动复制：
-
-\`\`\`bash
-python qwen21.py workflows --comfy /path/to/ComfyUI
-\`\`\`
-
----
-
-# 低显存启动
-
-推荐通过项目启动：
-
-\`\`\`bash
-python qwen21.py launch --comfy /path/to/ComfyUI
-\`\`\`
-
-它会自动带上：
-
-\`\`\`text
---lowvram
-\`\`\`
-
-如果你还需要局域网访问：
-
-\`\`\`bash
-python qwen21.py launch --comfy /path/to/ComfyUI -- --listen 0.0.0.0
-\`\`\`
-
----
-
-# 8GB 显卡建议
-
-建议：
-
-- 先从 **1024×1024**
-- 单张生成
-- 不要同时加载多个大模型
-- 关闭占显存的软件
-- 浏览器别开几十个标签页
-- 保持 \`--lowvram\`
-- 系统内存建议 32GB 或以上
-
-如果 OOM：
-
-1. 降低分辨率
-2. 重启 ComfyUI
-3. 关闭其他占显存程序
-4. 检查是否加载了其他 checkpoint
-5. 确认使用的是 Q4 GGUF
-
----
-
-# 适合哪些显卡
-
-这个仓库主要面向：
-
-- RTX 3060 8GB
-- RTX 4060 8GB
-- RTX 4060 Ti 8GB
-- RTX 3070 8GB
-- RTX 2080 / 2080 SUPER 8GB
-- RTX 5060 8GB
-- 其他 NVIDIA 8GB 显卡
-
-不同显卡速度会有明显差异。
-
-**8GB 主要解决的是“能不能跑”，不是保证速度一定快。**
-
----
-
-# 推荐测试提示词
-
-可以用这个 Prompt 测试文字生成能力：
-
-\`\`\`text
-Cinematic macro street photography of a vintage wooden coffee cart in Tokyo at dusk.
-Resting on the weathered counter is a clear paper cup with crisp, bold black handwritten lettering that reads:
-
-"QWEN 2.1 / 8GB VRAM"
-
-Soft golden bokeh lights, steam rising from an espresso machine,
-shallow depth of field, 85mm lens, realistic water droplets.
-\`\`\`
-
-如果模型能比较准确地生成：
-
-\`\`\`text
-QWEN 2.1 / 8GB VRAM
-\`\`\`
-
-就很适合作为项目 README 的实际运行截图。
-
----
-
-# 项目目标
-
-这个仓库不准备变成另一个巨型 ComfyUI 整合包。
-
-目标很简单：
-
-> **让只有 8GB 显存的人，尽可能少折腾地跑起来 Qwen-Image-2.1。**
-
-以后如果有更好的：
-
-- GGUF
-- FP8
-- NVFP4
-- 更低显存方案
-- 更快工作流
-- SageAttention / FlashAttention 优化
-- 6GB 显存方案
-
-也可以继续加入。
-
----
-
-# 上游项目
-
-Qwen-Image-2.1：
-
-https://github.com/QwenLM/Qwen-Image-2.1
-
-ComfyUI：
-
-https://github.com/comfyanonymous/ComfyUI
-
-ComfyUI-GGUF：
-
-https://github.com/leejet/ComfyUI-GGUF
-
-Qwen-Image-2.1 GGUF：
-
-https://huggingface.co/leejet/Qwen-Image-2.1-GGUF
-
-ComfyUI 模型文件：
-
-https://huggingface.co/Comfy-Org/Qwen-Image-2.1
-
----
-
-# License
-
-本仓库中的安装脚本和辅助代码采用 MIT License。
-
-模型权重不会重新打包或分发，模型本身遵循各自上游仓库的 License。
-
----
-
-如果这个项目帮你省下了折腾 CUDA、显存、ComfyUI 节点和模型路径的时间，可以点一个 ⭐。
-
-这样其他 **8GB 显卡用户**也更容易搜到这个方案。
+| `qwen21 install` | 完整安装（`--skip-models`、`--force`、`--recreate-env`、`--ref`） |
+| `qwen21 start` | 后台依次启动 ComfyUI、API、隧道 |
+| `qwen21 status` | 现在跑着什么、可以从哪里访问 |
+| `qwen21 doctor` | 检查硬件、文件、节点、密钥；有问题时返回非 0 |
+| `qwen21 stop` / `restart` | 全部停止 / 重启 |
+| `qwen21 logs api\|comfy\|tunnel` | 查看日志 |
+| `qwen21 tunnel --mode quick\|named\|off` | 单独管理公网入口 |
+| `qwen21 models` | 下载或校验模型 |
+| `qwen21 smoke` | 端到端测试：上传图片、执行编辑、报告体积与耗时 |
+| `qwen21 smoke --direct` | 用 ComfyUI 的 `/prompt` 校验生成的图结构 |
+| `qwen21 export` | 把 API 格式的工作流 JSON 写到 `workflows/api/` |
+| `qwen21 keygen [--write]` | 生成本地 API key |
+| `qwen21 keys` | 哪些密钥还是占位符、从哪里获取 |
+| `qwen21 serve` / `qwen21 comfy` | 只在前台运行 API / ComfyUI |
+
+## 公网接口
+
+默认是 Cloudflare **quick tunnel**：不需要账号、不需要 DNS，地址是随机的
+`*.trycloudflare.com`，每次重启都会变。
+
+需要固定域名时，把 `TUNNEL_MODE` 设为 `named`，并把 Cloudflare
+Zero Trust → Networks → Tunnels → Create 里的 token 粘进 `.env`。
+完整步骤与安全检查清单见 [docs/DEPLOY.md](docs/DEPLOY.md)。
+
+两个值得知道的设计细节：
+
+* **只有 API 会被暴露**，ComfyUI 始终监听 `127.0.0.1:8188`。
+* **请求不会一直阻塞到隧道超时**。Cloudflare 对超过约 100 秒没有数据返回的源站
+  会直接断开，而 25 步的编辑远不止 100 秒。所以请求最多等待 `SYNC_MAX_WAIT`
+  （默认 90 秒），没做完就返回 `202` 加一个 job id 供轮询。一个接口，不需要
+  客户端写重试逻辑。
+
+## 密钥
+
+只有一个是必需的。
+
+```bash
+qwen21 keygen --write     # 把 API_KEY 写进 .env
+```
+
+`TUNNEL_TOKEN`（Cloudflare，只有固定域名时需要）和 `HF_TOKEN`（Hugging Face，
+只在限流或需要授权仓库时才需要）都是可选的，`.env.example` 里写清了获取页面。
+`qwen21 doctor` 会列出所有还是占位符的配置项。
+
+## 目录结构
+
+```
+qwen21/          安装器、配置档表、进程管理、隧道管理
+qwen_api/        FastAPI 服务（独立虚拟环境，通过 HTTP 与 ComfyUI 通信）
+ComfyUI/         git 子模块，固定在 v0.37.0
+workflows/       ComfyUI 界面工作流 + 服务用的 API 格式图
+api/             API 服务依赖
+scripts/         从官方模板重新生成 workflows/
+docs/            API.md、DEPLOY.md、HARDWARE.md
+runtime/         虚拟环境、日志、pid、下载的工具、任务数据库（不进 git）
+tests/           只依赖标准库的单元测试：python -m unittest discover -s tests
+```
+
+服务是独立进程，通过 ComfyUI 官方 HTTP 接口通信。正因如此，同一套代码可以跑在
+Windows 便携版（自带 Python）、macOS 虚拟环境、以及远程 GPU 机器上，而不必让
+任何一端去 import 另一端的依赖。
+
+## 常见问题
+
+| 现象 | 原因 / 解决 |
+|---|---|
+| `doctor` 说 ComfyUI 版本太老 | 子模块被固定了版本：`git -C ComfyUI fetch --depth 1 origin tag v0.37.0 && git -C ComfyUI checkout v0.37.0` |
+| 加载时提示缺 `gguf` | `qwen21 install` 会安装节点依赖；如果你是手动装的节点，执行 `runtime/venvs/comfy/bin/pip install gguf` |
+| Cloudflare 报 `524` | 长任务的正常现象：改用 `wait=false` 加轮询，或换 named 隧道 |
+| NVIDIA 显存不足 | 关掉占显存的程序，降低 `resolution` / `steps`，编码器保持 `device=cpu` |
+| Mac 内存吃紧 / 很慢 | 8GB 机器的正常现象：换 `--profile mac-8gb-lite`，降低 `steps`，或把 `QwenImage21Cache` 的 `device` 设为 `off` |
+| `invalid API key` | 执行 `qwen21 keygen --write`，然后 `qwen21 stop && qwen21 start`（服务只在启动时读 `.env`） |
+
+## 致谢与许可
+
+* **Qwen-Image-2.1** — <https://github.com/QwenLM/Qwen-Image>（Apache-2.0）。
+  本仓库只负责本地部署，模型版权归 Qwen 团队。
+* **ComfyUI** — <https://github.com/Comfy-Org/ComfyUI>（GPL-3.0），以子模块引入。
+* **ComfyUI-GGUF** — <https://github.com/city96/ComfyUI-GGUF>（Apache-2.0）。
+* GGUF 权重 — <https://huggingface.co/leejet/Qwen-Image-2.1-GGUF>；
+  safetensors — <https://huggingface.co/Comfy-Org/Qwen-Image-2.1>。
+
+本仓库的辅助代码采用 MIT 许可（[LICENSE](LICENSE)）。**模型权重不在此分发**，
+遵循各自上游许可；把生成结果对外提供之前请先确认这些条款。
+
+[English](README.md)

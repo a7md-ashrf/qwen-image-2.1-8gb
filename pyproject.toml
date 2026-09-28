@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-image-2-1-8gb"
+version = "2.0.0"
+description = "All-in-one Qwen-Image-2.1 on 8GB hardware: ComfyUI + GGUF installer, image-edit HTTP API, public tunnel."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+api = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "httpx>=0.27", "python-multipart>=0.0.9"]
+
+[project.scripts]
+qwen21 = "qwen21.cli:main"
+
+[tool.setuptools]
+packages = ["qwen21", "qwen_api"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

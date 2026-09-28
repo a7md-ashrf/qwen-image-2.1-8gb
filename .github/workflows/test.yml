@@ -5,12 +5,69 @@ on:
   pull_request:
 
 jobs:
-  python:
+  unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # The installer is stdlib-only, so this needs no setup at all.
       - run: python -m unittest discover -s tests -v
-      - run: python qwen21.py --help
+      - run: python -m qwen21 --help
+      - run: python -m qwen21 export --profile nvidia-8gb
+      - run: python -m qwen21 export --profile mac-8gb
+      - name: the exported graphs must be valid JSON graphs
+        run: |
+          python - <<'PY'
+          import glob, json, os
+          for profile in ("nvidia-8gb", "mac-8gb"):
+              for kind in ("edit", "generate"):
+                  path = f"workflows/api/qwen21-{profile}-{kind}.json"
+                  assert os.path.isfile(path), path
+                  graph = json.load(open(path))
+                  assert graph["30"]["class_type"] == "TextEncodeQwenImage21", path
+                  assert graph["40"]["class_type"] == "KSampler", path
+                  assert graph["60"]["class_type"] == "SaveImage", path
+                  for node_id, node in graph.items():
+                      assert node["class_type"], (path, node_id)
+                      for value in node["inputs"].values():
+                          links = value.values() if isinstance(value, dict) else [value]
+                          for link in links:
+                              if isinstance(link, list):
+                                  assert link[0] in graph, (path, node_id, link)
+          print("ok:", *sorted(glob.glob("workflows/api/*.json")), sep="\n  ")
+          PY
+      - name: export must be deterministic
+        run: |
+          before=$(md5sum workflows/api/qwen21-mac-8gb-edit.json | cut -d' ' -f1)
+          python -m qwen21 export --profile mac-8gb >/dev/null
+          after=$(md5sum workflows/api/qwen21-mac-8gb-edit.json | cut -d' ' -f1)
+          test "$before" = "$after" && echo "deterministic ($before)"
+
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r api/requirements.txt
+      # Import-time check: a bad FastAPI signature or pydantic model would
+      # otherwise only surface on a machine with a GPU.
+      - name: import the app and list its routes
+        run: |
+          python - <<'PY'
+          from qwen_api.app import app
+          paths = {r.path for r in app.routes}
+          for expected in ("/healthz", "/v1/edit", "/v1/generate", "/v1/jobs/{job_id}",
+                           "/v1/jobs/{job_id}/image/{index}", "/v1/models"):
+              assert expected in paths, f"missing route {expected}: {sorted(paths)}"
+          print("routes ok:", *sorted(paths), sep="\n  ")
+          PY
+      - name: the OpenAPI schema must build
+        run: python -c "from qwen_api.app import app; app.openapi(); print('openapi ok')"
+      # With the dependencies present the integration tests run against a fake
+      # ComfyUI: auth, queueing, the 202 fallback, base64 output and the exact
+      # graph that reaches /prompt.
+      - run: python -m unittest discover -s tests -v
