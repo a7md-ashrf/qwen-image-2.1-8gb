@@ -749,7 +749,7 @@ def root_env_example() -> Path:
 
 def cmd_export(args: argparse.Namespace) -> int:
     root = Path(__file__).resolve().parent.parent
-    settings = config.resolve(root, args.profile, args.comfy_path)
+    settings = config.resolve(root, args.profile, args.comfy_path, require_comfy=False)
     sys.path.insert(0, str(root))
     from qwen_api.workflows import ModelSpec, build_edit_prompt, build_generate_prompt
 

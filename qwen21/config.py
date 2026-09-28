@@ -89,7 +89,15 @@ def resolve(
     root: Path | None = None,
     profile_name: str | None = None,
     comfy_path: str | Path | None = None,
+    require_comfy: bool = True,
 ) -> Settings:
+    """Resolve settings for a command.
+
+    `require_comfy=False` is for the commands that only need the profile (the
+    model names, the flags) and must work in a clone whose ComfyUI submodule has
+    not been initialised yet - otherwise `qwen21 export` fails for anyone who
+    cloned without --recurse-submodules.
+    """
     root = root or repo_root()
     load_env(env_path())
 
@@ -107,8 +115,8 @@ def resolve(
         comfy = comfy_install.normalize_comfy(Path(comfy_path).expanduser())
     else:
         comfy = root / "ComfyUI"
-        if not (comfy / "main.py").is_file():
-            comfy_install.normalize_comfy(comfy)
+        if require_comfy or (comfy / "main.py").is_file():
+            comfy = comfy_install.normalize_comfy(comfy)
 
     comfy_python = comfy_install.venv_python(runtime_dir() / "venvs" / "comfy")
     if not comfy_python.is_file():

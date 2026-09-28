@@ -9,10 +9,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       # The installer is stdlib-only, so this needs no setup at all.
+      - name: the pinned ComfyUI must be the one the profiles target
+        run: |
+          test -f ComfyUI/main.py || { echo "ComfyUI submodule missing"; exit 1; }
+          grep -q '__version__ = "0.37' ComfyUI/comfyui_version.py \
+            || { echo "submodule is not the pinned 0.37.x release"; exit 1; }
       - run: python -m unittest discover -s tests -v
       - run: python -m qwen21 --help
       - run: python -m qwen21 export --profile nvidia-8gb
@@ -49,6 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
