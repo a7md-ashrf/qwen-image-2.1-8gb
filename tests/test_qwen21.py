@@ -355,7 +355,7 @@ class TestTunnel(unittest.TestCase):
         self.assertIn("http://127.0.0.1:8000", cmd)
 
     def test_named_tunnel_uses_the_token(self):
-        token = "eyJhIjoiYWJjIiwidCI6ImRlZiJ9"
+        token = "TEST-NOT-A-REAL-TOKEN"
         cmd = tunnel.build_cmd(Path("/tmp/cloudflared"), "named", "http://x", token)
         self.assertIn("run", cmd)
         self.assertIn(token, cmd)
@@ -367,10 +367,10 @@ class TestTunnel(unittest.TestCase):
 
     def test_token_detection_ignores_placeholders(self):
         self.assertIsNone(tunnel.load_token({}))
-        self.assertIsNone(tunnel.load_token({"TUNNEL_TOKEN": "TODO-paste-your-tunnel-token"}))
-        self.assertEqual(
-            tunnel.load_token({"TUNNEL_TOKEN": "eyJhIjoiYWJjIn0.extra"}), "eyJhIjoiYWJjIn0.extra"
-        )
+        self.assertIsNone(tunnel.load_token({"TUNNEL_TOKEN": "TODO-paste-the-token"}))
+        # a real tunnel token is the base64 blob Cloudflare prints
+        blob = "eyJhIjoiYWJjIiwidCI6ImRlZiJ9"
+        self.assertEqual(tunnel.load_token({"TUNNEL_TOKEN": blob}), blob)
 
     def test_public_url(self):
         self.assertEqual(tunnel.public_url("named", "img.example.com"), "https://img.example.com")

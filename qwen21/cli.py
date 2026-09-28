@@ -461,7 +461,7 @@ def cmd_tunnel(args: argparse.Namespace) -> int:
     if mode == "named" and not tunnel.load_token():
         log("TUNNEL_TOKEN looks empty. Create a tunnel at")
         log("  Cloudflare Zero Trust -> Networks -> Tunnels -> Create a tunnel")
-        log("  then paste the token from the install command into .env as TUNNEL_TOKEN=eyJhIjoi…")
+        log("  then paste that base64 blob into .env as TUNNEL_TOKEN=<the blob>")
         return 2
     service = _tunnel_service(settings, mode)
     assert service

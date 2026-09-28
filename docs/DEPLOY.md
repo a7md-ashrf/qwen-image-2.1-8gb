@@ -36,9 +36,9 @@ not support Server-Sent Events, which is one more reason the API uses polling
 2. **Create a tunnel** → name it (e.g. `qwen-image`) → pick the OS → copy the
    install command. It looks like:
    ```
-   cloudflared.exe service install eyJhIjoi<BASE64-JSON...>
+   cloudflared.exe service install <BASE64-BLOB>
    ```
-   Everything from `eyJhIjoi` to the end is the **tunnel token**. It is a
+   The long base64 blob at the end of that command is the **tunnel token**. It is a
    base64 JSON blob that already contains your account, tunnel id and secret -
    treat it like a password.
 3. In **Public Hostname** add a route: subdomain (e.g. `img`) + domain (a zone
@@ -46,7 +46,7 @@ not support Server-Sent Events, which is one more reason the API uses polling
 4. Put both values in `.env`:
    ```env
    TUNNEL_MODE=named
-   TUNNEL_TOKEN=eyJhIjoi<BASE64-JSON...>
+   TUNNEL_TOKEN=<paste-the-base64-blob-here>
    TUNNEL_HOSTNAME=img.example.com
    PUBLIC_BASE_URL=https://img.example.com   # so responses contain absolute image URLs
    ```
