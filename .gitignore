@@ -7,9 +7,8 @@ __pycache__/
 *.part
 .DS_Store
 
-# Everything this tool creates at runtime
+# Model weights are never in git: ComfyUI/ ignores its own models/, and
+# runtime/ is everything this tool creates (venvs, logs, pids, job database).
+models/
 runtime/
 !runtime/.gitkeep
-
-# The ComfyUI submodule keeps its own .gitignore (models/, output/, input/,
-# custom_nodes/ and user/ are ignored by ComfyUI itself).

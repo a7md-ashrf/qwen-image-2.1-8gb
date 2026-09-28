@@ -98,65 +98,88 @@ and the security checklist: [docs/DEPLOY.md](docs/DEPLOY.md).
 Two design details worth knowing:
 
 * **The API is the only thing published.** ComfyUI stays on `127.0.0.1:8188`.
-* **A request never blocks past the tunnel's patience.** Cloudflare drops an
-  origin response after ~100 s of silence; a 25-step edit takes longer. So a call
-  waits up to `SYNC_MAX_WAIT` (90 s) and otherwise returns `202` with a job id
-  you can poll. One endpoint, no client-side retry logic.
+* **A request never blocks past the tunnel's patience.** Cloudflare's proxy read
+  timeout is 125 s (`524`); a 25-step edit takes longer. So a call waits up to
+  `SYNC_MAX_WAIT` (90 s) and otherwise returns `202` with a job id you can poll.
+  One endpoint, no client-side retry logic.
 
 ## Keys
 
 Only one is mandatory.
 
-```bash
-qwen21 keygen --write     # API_KEY in .env
+## Windows quick start
+
+The installer handles all of this, but the manual path is here if you want it.
+
+### Requirements
+
+- Windows 10/11 (64-bit), NVIDIA GPU with a current driver
+- [Git](https://git-scm.com/download/win) and [Python 3.11–3.12 (64-bit)](https://www.python.org/downloads/) —
+  tick **"Add python.exe to PATH"** during install
+- ~12 GB free disk for the `nvidia-8gb` profile (4.2 GB transformer + 6.3 GB
+  encoder + 0.7 GB VAE + ~2 GB of Python environments)
+- 16 GB system RAM is comfortable; 8 GB works but pages hard
+
+> No CUDA toolkit install needed: the CUDA runtime ships inside the PyTorch wheels.
+
+### 1. Clone and install
+
+```powershell
+git clone --recurse-submodules https://github.com/a7md-ashrf/qwen-image-2.1-8gb
+cd qwen-image-2.1-8gb
+.\install.ps1
 ```
 
-`TUNNEL_TOKEN` (Cloudflare, only for a stable URL) and `HF_TOKEN` (Hugging Face,
-only for rate limits or gated repos) are optional and documented in
-`.env.example` with the exact page to get them from. `qwen21 doctor` lists
-whatever is still a placeholder.
+`install.ps1` finds a suitable Python, initialises the ComfyUI submodule, builds
+the virtualenvs, installs the GGUF loader, downloads the models and writes
+`.env`. If PowerShell refuses to run the script:
 
-## Layout
-
-```
-qwen21/          installer, profile table, process supervisor, tunnel manager
-qwen_api/        the FastAPI service (separate venv, talks HTTP to ComfyUI)
-ComfyUI/         git submodule, pinned to v0.37.0
-workflows/       UI workflows for ComfyUI + API-format graphs for the service
-api/             API service requirements
-scripts/         regenerates workflows/ from the official templates
-docs/            API.md, DEPLOY.md, HARDWARE.md
-runtime/         venvs, logs, pids, downloaded tools, job database (gitignored)
-tests/           stdlib unit tests: python -m unittest discover -s tests
+```powershell
+Set-ExecutionPolicy -Scope Process RemoteSigned
 ```
 
-The service is a separate process talking to ComfyUI over its documented HTTP
-API. That is what makes one codebase work on a Windows portable install (with
-its embedded Python), a macOS venv, and a remote GPU box, without any of them
-having to import the other's dependencies.
+### 2. Generate the API key and start
 
-## Troubleshooting
+```powershell
+qwen21 keygen --write
+qwen21 start
+qwen21 status
+```
 
-| symptom | cause / fix |
-|---|---|
-| `doctor` says ComfyUI is too old | the submodule is pinned; `git -C ComfyUI fetch --depth 1 origin tag v0.37.0 && git -C ComfyUI checkout v0.37.0` |
-| `Missing: gguf` at load time | `qwen21 install` installs the node's `requirements.txt`; if you added the node by hand, `runtime/venvs/comfy/bin/pip install gguf` |
-| `524` from Cloudflare | expected for long jobs: use `wait=false` and poll, or a named tunnel |
-| OOM on NVIDIA | close GPU-heavy apps, drop `resolution`/`steps`, keep the encoder on `device=cpu` |
-| Mac swapping / very slow | expected on 8GB; use `--profile mac-8gb-lite`, lower `steps`, and `QwenImage21Cache(device=off)` |
-| `invalid API key` | `qwen21 keygen --write`, then `qwen21 stop && qwen21 start` (the service reads `.env` at start) |
+`start` waits for ComfyUI to answer and then for the API to answer, so the URL it
+prints is already live.
 
-## Credits and licence
+### 3. Call it
 
-* **Qwen-Image-2.1** — <https://github.com/QwenLM/Qwen-Image> (Apache-2.0).
-  This repository only handles local plumbing; the model belongs to the Qwen team.
-* **ComfyUI** — <https://github.com/Comfy-Org/ComfyUI> (GPL-3.0) as a submodule.
-* **ComfyUI-GGUF** — <https://github.com/city96/ComfyUI-GGUF> (Apache-2.0).
-* GGUF weights — <https://huggingface.co/leejet/Qwen-Image-2.1-GGUF>;
-  safetensors — <https://huggingface.co/Comfy-Org/Qwen-Image-2.1>.
+Use `curl.exe`, not `curl` — PowerShell aliases `curl` to `Invoke-WebRequest`,
+which does not accept `-F`:
 
-Helper code in this repository is MIT licensed ([LICENSE](LICENSE)). Model weights
-are **not** redistributed here and stay under their upstream licences; review
-them before serving generated images to anyone.
+```powershell
+$env:KEY = (Select-String -Path .env -Pattern '^API_KEY=(.*)$').Matches[0].Groups[1].Value
+curl.exe -H "Authorization: Bearer $env:KEY" http://127.0.0.1:8000/v1/models
+curl.exe -H "Authorization: Bearer $env:KEY" -F "image=@input.png" -F "prompt=Change the background to a sunset" http://127.0.0.1:8000/v1/edit -o response.json
+```
 
-[简体中文](README_zh-CN.md)
+### 4. Firewall
+
+Nothing to do: `API_HOST` and `COMFY_HOST` both default to `127.0.0.1`, so
+Windows will not prompt and nothing is reachable from the network. The tunnel
+publishes the API over outbound connections only. If you deliberately change
+`API_HOST` to `0.0.0.0`, pre-approve the port:
+
+```powershell
+netsh advfirewall firewall add rule name="Qwen Image API" dir=in action=allow protocol=TCP localport=8000
+```
+
+### Troubleshooting
+
+- **`doctor` says "ComfyUI does not know node …"** — the checkout is older than
+  v0.37.0; the submodule is pinned, so this only happens on a stale clone.
+- **Out of memory on first job** — close GPU-heavy apps, lower `resolution` to
+  768 or `steps` to 15, keep the encoder on `device=cpu` (the profile already
+  does), and `qwen21 stop && qwen21 start` so old weights leave VRAM.
+- **`CUDA is not available` / torch picked a CPU build** — check `nvidia-smi`
+  works in the same terminal, then reinstall torch from
+  <https://pytorch.org/get-started/locally/> choosing the CUDA build.
+- **A job sits at `queued`** — `MAX_CONCURRENT` is 1 and ComfyUI runs one job at
+  a time; poll `qwen21 status` for the queue.
