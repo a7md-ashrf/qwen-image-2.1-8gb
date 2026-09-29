@@ -130,6 +130,9 @@ class FakeComfyUI(BaseHTTPRequestHandler):
 
 
 RESET_KEYS = (
+    "MONGODB",
+    "MONGODB_COLLECTION",
+    "HOST_NAME",
     "COMFY_URL",
     "API_KEY",
     "QWEN_OUTPUT_DIR",
@@ -148,6 +151,9 @@ RESET_KEYS = (
 
 def load_app(comfy_url: str, output_dir: str, **env: str):
     """Import a fresh copy of the app with exactly this environment."""
+    previous = sys.modules.get("qwen_api.app")
+    if previous is not None and hasattr(previous, "store"):
+        previous.store.close()  # do not leak a sqlite handle per reload
     for module in [m for m in list(sys.modules) if m.startswith("qwen_api")]:
         del sys.modules[module]
     for key in RESET_KEYS:
@@ -359,6 +365,148 @@ class TestAuthAndLimits(ApiTestCase):
     def test_an_empty_prompt_is_refused(self):
         response = self.post_edit(prompt="   ")
         self.assertEqual(response.status_code, 422)
+
+
+class FakeCollection:
+    """The slice of a pymongo collection the registry actually uses."""
+
+    def __init__(self, fail: bool = False, duplicate: bool = False) -> None:
+        self.calls: list[tuple] = []
+        self.documents: dict[str, dict] = {}
+        self.fail = fail
+        self.duplicate = duplicate
+        self.indexes: list = []
+
+    async def create_index(self, field, **kwargs):
+        self.indexes.append((field, kwargs))
+
+    async def update_one(self, query, update, upsert=False):
+        self.calls.append((query, update, upsert))
+        if self.fail:
+            from pymongo.errors import ServerSelectionTimeoutError
+
+            raise ServerSelectionTimeoutError("simulated MongoDB outage")
+        if self.duplicate and upsert:
+            from pymongo.errors import DuplicateKeyError
+
+            raise DuplicateKeyError("simulated duplicate")
+        key = query["device"]
+        self.documents.setdefault(key, {}).update(update["$set"])
+        return None
+
+    async def find_one(self, query, projection=None):
+        return self.documents.get(query["device"])
+
+
+class TestDeviceRegistry(ApiTestCase):
+    env = {"HOST_NAME": "rtx4060-box", "MONGODB": "mongodb+srv://u:p@cluster.example.net/tunnels"}
+
+    def _stub(self, **kwargs):
+        """Replace the app's registry with a fake collection."""
+        collection = FakeCollection(**kwargs)
+        self.module.registry._collection = collection
+        self.module.registry._index_ready = False
+        return collection
+
+    def _publish(self, link="https://olive-pans.trycloudflare.com/v1/edit"):
+        return self.client.post(
+            "/v1/internal/tunnel", json={"link": link}, headers=self.auth
+        )
+
+    def test_publish_writes_link_device_and_updated_at(self):
+        collection = self._stub()
+        response = self._publish()
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["published"])
+        self.assertEqual(body["device"], "rtx4060-box")
+        self.assertEqual(body["link"], "https://olive-pans.trycloudflare.com/v1/edit")
+        self.assertTrue(body["updated_at"])
+        query, update, upsert = collection.calls[0]
+        self.assertEqual(query, {"device": "rtx4060-box"})
+        self.assertTrue(upsert, "must upsert so a reconnect overwrites the old row")
+        self.assertEqual(set(update["$set"]), {"link", "device", "updated_at"})
+        self.assertEqual(collection.indexes, [("device", {"unique": True,
+                                                           "name": "device_unique"})])
+
+    def test_the_device_comes_from_the_server_not_the_body(self):
+        self._stub()
+        response = self.client.post(
+            "/v1/internal/tunnel",
+            json={"link": "https://x.trycloudflare.com/v1/edit", "device": "someone-else"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["device"], "rtx4060-box")
+
+    def test_reconnecting_overwrites_the_same_row(self):
+        collection = self._stub()
+        self._publish("https://first.trycloudflare.com/v1/edit")
+        self._publish("https://second.trycloudflare.com/v1/edit")
+        self.assertEqual(len(collection.documents), 1, "one row per device")
+        stored = collection.documents["rtx4060-box"]
+        self.assertEqual(stored["link"], "https://second.trycloudflare.com/v1/edit")
+
+    def test_duplicate_key_race_retries_without_upsert(self):
+        collection = self._stub(duplicate=True)
+        response = self._publish()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual([call[2] for call in collection.calls], [True, False])
+
+    def test_mongodb_outage_is_503_and_never_touches_the_endpoint(self):
+        self._stub(fail=True)
+        response = self._publish()
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("registry unavailable", response.json()["detail"])
+        # the service is still fully functional
+        self.assertEqual(self.client.get("/healthz").json()["status"], "ok")
+        self.assertEqual(self.client.get("/v1/models", headers=self.auth).status_code, 200)
+
+    def test_non_https_links_are_refused(self):
+        self._stub()
+        for bad in ("http://x.trycloudflare.com/v1/edit", "https://", "ftp://a/b"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._publish(bad).status_code, 400)
+
+    def test_publish_needs_the_api_key(self):
+        self._stub()
+        response = self.client.post(
+            "/v1/internal/tunnel",
+            json={"link": "https://x.trycloudflare.com/v1/edit"},
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_registry_read_reports_what_is_stored(self):
+        self._stub()
+        self._publish("https://olive-pans.trycloudflare.com/v1/edit")
+        body = self.client.get("/v1/registry", headers=self.auth).json()
+        self.assertTrue(body["published"])
+        self.assertEqual(body["link"], "https://olive-pans.trycloudflare.com/v1/edit")
+        self.assertIn("tunnels", body["target"])
+        self.assertNotIn("p@", body["target"])
+
+    def test_registry_read_reports_nothing_yet(self):
+        self._stub()
+        body = self.client.get("/v1/registry", headers=self.auth).json()
+        self.assertFalse(body["published"])
+        self.assertEqual(body["device"], "rtx4060-box")
+
+class TestRegistryDisabled(ApiTestCase):
+    env = {"HOST_NAME": "some-box", "MONGODB": ""}
+
+    def test_publish_is_503_when_unconfigured(self):
+        response = self.client.post(
+            "/v1/internal/tunnel",
+            json={"link": "https://x.trycloudflare.com/v1/edit"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("MONGODB is not set", response.json()["detail"])
+        self.assertEqual(self.client.get("/healthz").json()["status"], "ok")
+
+    def test_the_service_works_with_no_registry_at_all(self):
+        body = self.post_edit(prompt="x").json()
+        self.assertEqual(body["status"], "succeeded")
 
 
 class TestSlowJobsBecomeAsync(ApiTestCase):

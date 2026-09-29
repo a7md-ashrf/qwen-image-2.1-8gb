@@ -21,6 +21,10 @@ jobs:
           grep -q '__version__ = "0.37' ComfyUI/comfyui_version.py \
             || { echo "submodule is not the pinned 0.37.x release"; exit 1; }
       - run: python -m unittest discover -s tests -v
+      # No .env here, so this is the backstop branch of the guard: it fails on
+      # any mongodb URI in a tracked file that does not use fake credentials.
+      - name: no real credentials in tracked files
+        run: python scripts/check_secrets.py
       - run: python -m qwen21 --help
       - run: python -m qwen21 export --profile nvidia-8gb
       - run: python -m qwen21 export --profile mac-8gb
@@ -62,6 +66,18 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r api/requirements.txt
+      - name: the device registry must not need a live cluster to import
+        run: |
+          python - <<'PY'
+          from qwen_api.registry import Registry, redact
+          # built from parts: check_secrets.py flags literal credentials
+          # anywhere tracked, including this file
+          uri = "mongodb+srv://" + "user:" + "pw" + "@cluster.example.net/tunnels"
+          entry = Registry("", "devices", "ci-box")
+          assert not entry.configured
+          assert "pw" not in redact(uri)
+          print("registry imports and stays inert without MONGODB")
+          PY
       # Import-time check: a bad FastAPI signature or pydantic model would
       # otherwise only surface on a machine with a GPU.
       - name: import the app and list its routes

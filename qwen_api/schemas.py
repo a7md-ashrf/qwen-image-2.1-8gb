@@ -73,6 +73,29 @@ class Health(BaseModel):
     models: dict[str, Any] = Field(default_factory=dict)
 
 
+class TunnelPublish(BaseModel):
+    """Body of POST /v1/internal/tunnel.
+
+    The device is deliberately *not* accepted here: it comes from the server's
+    own HOST_NAME, so a caller with a valid key cannot write rows for other
+    machines.
+    """
+
+    link: str = Field(
+        ...,
+        max_length=512,
+        description="the device's public edit URL, e.g. https://x.trycloudflare.com/v1/edit",
+    )
+
+
+class RegistryEntry(BaseModel):
+    published: bool
+    device: str | None = None
+    link: str | None = None
+    updated_at: str | None = None
+    target: str = ""
+
+
 class ModelCard(BaseModel):
     id: str
     object: str = "model"

@@ -25,7 +25,8 @@ macOS venv can sit on the same repo without dependency conflicts.
   probes, no systemd/launchd), `tunnel.py` (cloudflared quick/named).
 - `qwen_api/` — the service: `app.py` (routes), `workflows.py` (builds the
   **API-format** ComfyUI graph in code), `comfy_client.py` (5 ComfyUI
-  endpoints), `jobs.py` (SQLite-backed job table), `config.py`, `schemas.py`.
+  endpoints), `jobs.py` (SQLite-backed job table), `registry.py` (device →
+  public link in MongoDB), `config.py`, `schemas.py`.
 - `ComfyUI/` — git submodule, pinned `v0.37.0` (first stable release with
   `TextEncodeQwenImage21` + `QwenImage21Cache`).
 - `workflows/` — UI templates regenerated from Comfy-Org's by
@@ -82,6 +83,18 @@ timeout is 125 s; a 25-step edit takes longer than that on this hardware.
   CLI itself.
 - The `TextEncodeQwenImage21` autogrow input is a **dict of slot → link** in API
   format, not a dotted `images.image_1` input.
+
+## Device registry (optional)
+A quick tunnel hostname is random per restart, so `HOST_NAME` (default: OS
+hostname) is the stable key. `qwen21 start` POSTs the live link to
+`POST /v1/internal/tunnel`; the service upserts `{link, device, updated_at}`
+into MongoDB with a **unique index on `device`**, so a restart overwrites the
+device's own row. `pymongo.AsyncMongoClient` — Motor hit EOL in May 2026.
+Three rules: the device comes from the server config, never the request body;
+the URI is never logged; and the registry is **best-effort**, so a Mongo outage
+returns 503 on the publish route and never affects the endpoint.
+`scripts/check_secrets.py` fails the build if a real credential reaches a
+tracked file — its own test fixtures are assembled from parts for that reason.
 
 ## Pending, agreed but not implemented
 Cloudflare request-size ceiling: Free/Pro cap uploads at **100 MB** (Business

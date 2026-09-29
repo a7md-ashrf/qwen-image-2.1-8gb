@@ -85,6 +85,7 @@ own. Details and honest expectations: [docs/HARDWARE.md](docs/HARDWARE.md).
 | `qwen21 keygen [--write]` | generate the local API key |
 | `qwen21 keys` | which secrets are still placeholders, and where to get them |
 | `qwen21 serve` / `qwen21 comfy` | run just the API / just ComfyUI, in the foreground |
+| `python scripts/check_secrets.py` | fail if a real credential is in a tracked file |
 
 ## Public endpoint
 

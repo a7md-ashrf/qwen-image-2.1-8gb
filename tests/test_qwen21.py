@@ -264,41 +264,46 @@ class TestWorkflows(unittest.TestCase):
 
 
 class TestApiConfig(unittest.TestCase):
-    def test_sync_wait_defaults_under_the_cloudflare_timeout(self):
+    """Settings come from the environment, so build them the real way."""
+
+    def _load(self, **env):
+        import os
+
         from qwen_api import config
 
-        settings = config.Settings(
-            comfy_url="http://127.0.0.1:8188",
-            host="127.0.0.1",
-            port=8000,
-            api_key="x",
-            allow_anonymous=False,
-            public_base_url="",
-            unet="",
-            unet_gguf=True,
-            clip="",
-            vae="",
-            encoder_device="cpu",
-            cache_device="auto",
-            cache_dtype="default",
-            default_resolution=1024,
-            default_steps=25,
-            default_cfg=1.0,
-            default_sampler="euler",
-            default_scheduler="simple",
-            sync_max_wait=90.0,
-            max_concurrent=1,
-            max_queue=8,
-            job_timeout=3600.0,
-            job_ttl_hours=24.0,
-            rate_limit_per_min=10.0,
-            max_upload_mb=25.0,
-            max_images=4,
-            poll_interval=1.5,
-            output_dir=Path("."),
-        )
-        self.assertLess(settings.sync_max_wait, 100.0)
+        previous = {k: os.environ.get(k) for k in env}
+        os.environ.update({k: str(v) for k, v in env.items()})
+        try:
+            return config.load()
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_sync_wait_defaults_under_the_cloudflare_read_timeout(self):
+        settings = self._load()
+        # Cloudflare's proxy read timeout is 125 s (524). We must give up first.
+        self.assertLess(settings.sync_max_wait, 125.0)
         self.assertEqual(settings.max_upload_bytes, 25 * 1024 * 1024)
+
+    def test_registry_settings_come_from_the_environment(self):
+        settings = self._load(HOST_NAME="rtx4060-box", MONGODB="mongodb+srv://u:p@h/db",
+                              MONGODB_COLLECTION="boxes")
+        self.assertEqual(settings.host_name, "rtx4060-box")
+        self.assertEqual(settings.mongodb_uri, "mongodb+srv://u:p@h/db")
+        self.assertEqual(settings.mongodb_collection, "boxes")
+
+    def test_host_name_falls_back_to_the_os_hostname(self):
+        import socket
+
+        self.assertEqual(self._load(HOST_NAME="").host_name, socket.gethostname())
+
+    def test_mongodb_is_off_until_it_is_configured(self):
+        settings = self._load(MONGODB="")
+        self.assertEqual(settings.mongodb_uri, "")
+        self.assertEqual(settings.mongodb_collection, "devices")
 
 
 class TestJobs(unittest.TestCase):
@@ -453,6 +458,104 @@ class TestComfyResponses(unittest.TestCase):
         verdict, messages = cli._classify(500, "boom")
         self.assertEqual(verdict, "invalid")
         self.assertTrue(messages)
+
+
+class TestNoSecretsCommitted(unittest.TestCase):
+    """The guard that keeps credentials out of git, tested against itself."""
+
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        import check_secrets
+
+        self.check = check_secrets
+
+    def test_this_repository_passes(self):
+        self.assertEqual(self.check.main(), 0)
+
+    @staticmethod
+    def _uri(user: str, password: str, host: str = "cluster0.mongodb.net") -> str:
+        # Assembled from parts on purpose: see check_secrets.py - a literal here
+        # would be a real leak and the guard would (correctly) fail on this file.
+        return f"mongodb+srv://{user}:{password}" + f"@{host}/tunnels"
+
+    def test_a_real_uri_in_a_tracked_file_is_caught(self):
+        secret = self._uri("realuser", "realpassword123")
+        problems = self.check.scan(secret, "leak.md", {"MONGODB": secret})
+        self.assertTrue(any("MONGODB" in p for p in problems), problems)
+        self.assertTrue(any("non-placeholder" in p for p in problems), problems)
+
+    def test_a_verbatim_secret_is_caught_even_without_a_uri(self):
+        key = "qk-" + "abcdefghijklmnopqrstuvwxyz012345"
+        problems = self.check.scan(f'token = "{key}"', "leak.py", {"API_KEY": key})
+        self.assertTrue(any("API_KEY" in p for p in problems), problems)
+
+    def test_placeholder_credentials_are_allowed(self):
+        for uri in (self._uri("u", "p", "h") + "",
+                    self._uri("USER", "PASSWORD", "cluster.example.net"),
+                    self._uri("user", "password", "cluster.example.net"),
+                    self._uri("user", "TODO", "cluster.example.net")):
+            with self.subTest(uri=uri):
+                self.assertEqual(self.check.scan(uri, "docs.md", {}), [])
+
+    def test_a_short_secret_is_not_treated_as_a_secret(self):
+        # 8 characters is the floor; below that, matches are noise.
+        self.assertNotIn("x", self.check.local_secrets())
+
+    def test_redaction_never_leaks_the_password(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from qwen_api.registry import redact
+
+        uri = self._uri("user", "supersecret")
+        redacted = redact(uri)
+        self.assertNotIn("supersecret", redacted)
+        self.assertIn("cluster0.mongodb.net", redacted)
+
+
+class TestRegistryLinks(unittest.TestCase):
+    @staticmethod
+    def _uri(user: str, password: str, host: str) -> str:
+        return f"mongodb+srv://{user}:{password}" + f"@{host}/tunnels"
+
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from qwen_api import registry
+
+        self.registry = registry
+
+    def test_only_https_links_are_accepted(self):
+        self.assertEqual(
+            self.registry.validate_link("https://x.trycloudflare.com/v1/edit"),
+            "https://x.trycloudflare.com/v1/edit",
+        )
+        for bad in ("http://x.trycloudflare.com", "https://", "", "   ",
+                    "https://x.com/\r\nX-Evil: 1", "https://" + "a" * 600):
+            with self.subTest(bad=bad[:30]):
+                with self.assertRaises(ValueError):
+                    self.registry.validate_link(bad)
+
+    def test_database_comes_from_the_uri_path(self):
+        self.assertEqual(
+            self.registry.Registry("mongodb+srv://u:p@h/tunnels", "devices", "d").device_database,
+            "tunnels",
+        )
+        self.assertEqual(
+            self.registry.Registry("mongodb+srv://u:p@h/", "devices", "d").device_database,
+            "test",
+        )
+
+    def test_unconfigured_registry_refuses_publish_instead_of_connecting(self):
+        import asyncio
+
+        entry = self.registry.Registry("", "devices", "macm3")
+        self.assertFalse(entry.configured)
+        with self.assertRaises(self.registry.RegistryError):
+            asyncio.run(entry.publish("https://x.trycloudflare.com/v1/edit"))
+        self.assertIn("not configured", entry.target)
+
+    def test_target_never_contains_credentials(self):
+        entry = self.registry.Registry(self._uri("u", "hunter2", "h"), "devices", "d")
+        self.assertNotIn("hunter2", entry.target)
+        self.assertIn("tunnels", entry.target)
 
 
 class TestRunner(unittest.TestCase):

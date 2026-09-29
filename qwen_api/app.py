@@ -33,6 +33,7 @@ from . import workflows
 from .comfy_client import ComfyClient, ComfyError, history_error
 from .config import settings
 from .jobs import FAILED, SUCCEEDED, Job, JobStore
+from .registry import Registry, RegistryError, validate_link
 from .schemas import (
     EditRequest,
     GenerateRequest,
@@ -40,7 +41,9 @@ from .schemas import (
     JobList,
     JobStatus,
     ModelCard,
+    RegistryEntry,
     SampleParams,
+    TunnelPublish,
 )
 from .workflows import ModelSpec
 
@@ -74,6 +77,7 @@ CANDIDATES = {
 
 store = JobStore(settings.output_dir, settings.job_ttl_hours)
 comfy: ComfyClient | None = None
+registry = Registry(settings.mongodb_uri, settings.mongodb_collection, settings.host_name)
 _spec_cache: dict[str, Any] = {"spec": None, "at": 0.0, "warnings": []}
 _hits: dict[str, deque[float]] = defaultdict(deque)
 _capacity_lock = asyncio.Lock()
@@ -102,6 +106,7 @@ async def lifespan(app: FastAPI):
         if comfy is not None:
             await comfy.aclose()
         comfy = None
+        await registry.close()
 
 
 app = FastAPI(
@@ -589,6 +594,55 @@ async def job_cancel(job_id: str) -> dict[str, Any]:
     if job.comfy_prompt_id:
         await _client().interrupt()
     return {"id": job.id, "status": job.status, "cancelled": True}
+
+
+@app.post(
+    f"{API}/internal/tunnel",
+    response_model=RegistryEntry,
+    dependencies=[Depends(require_key)],
+)
+async def publish_tunnel(body: TunnelPublish) -> RegistryEntry:
+    """Record this device's public link, overwriting whatever was there.
+
+    Called by `qwen21 start` once the tunnel is live. Idempotent: a device that
+    restarts publishes again and the same row is updated, which is what makes
+    the collection a "where is each machine right now" list rather than a log.
+    """
+    try:
+        validate_link(body.link)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        record = await registry.publish(body.link)
+    except RegistryError as exc:
+        # The endpoint is healthy; only the directory is not. Say so, do not
+        # make the caller think the tunnel is down.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"device registry unavailable: {exc}",
+            headers={"Retry-After": "30"},
+        ) from exc
+    except Exception as exc:  # nothing the registry does may become a 500
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"device registry failed: {type(exc).__name__}",
+            headers={"Retry-After": "30"},
+        ) from exc
+    record["published"] = True
+    record["target"] = registry.target
+    return RegistryEntry(**record)
+
+
+@app.get(f"{API}/registry", response_model=RegistryEntry, dependencies=[Depends(require_key)])
+async def registry_entry() -> RegistryEntry:
+    """What is currently stored for this device."""
+    record = await registry.current()
+    if record is None:
+        return RegistryEntry(published=False, device=settings.host_name,
+                             target=registry.target)
+    record["published"] = True
+    record["target"] = registry.target
+    return RegistryEntry(**record)
 
 
 async def _sweep_loop() -> None:

@@ -5,3 +5,7 @@ uvicorn[standard]>=0.30
 httpx>=0.27
 python-multipart>=0.0.9
 pydantic>=2.7
+
+# Device registry. Motor reached end of life in May 2026, so this uses
+# pymongo's own async client (GA since 4.9) rather than the deprecated driver.
+pymongo>=4.9

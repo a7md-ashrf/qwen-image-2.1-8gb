@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,19 @@ class Settings:
         return self.api_url
 
     @property
+    def host_name(self) -> str:
+        """Stable per-machine key. The OS hostname unless .env overrides it."""
+        return os.environ.get("HOST_NAME", "").strip() or socket.gethostname()
+
+    @property
+    def mongodb_uri(self) -> str:
+        return os.environ.get("MONGODB", "").strip()
+
+    @property
+    def mongodb_collection(self) -> str:
+        return os.environ.get("MONGODB_COLLECTION", "devices").strip() or "devices"
+
+    @property
     def venv_comfy(self) -> Path:
         return runtime_dir() / "venvs" / "comfy"
 
@@ -65,6 +79,9 @@ class Settings:
             "COMFY_URL": self.comfy_url,
             "API_HOST": self.api_host,
             "API_PORT": str(self.api_port),
+            "HOST_NAME": self.host_name,
+            "MONGODB": self.mongodb_uri,
+            "MONGODB_COLLECTION": self.mongodb_collection,
             "QWEN_PROFILE": self.profile.name,
             "QWEN_UNET": self.profile.model("diffusion_models").name
             if self.profile.model("diffusion_models")

@@ -181,6 +181,11 @@ def cmd_install(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 
+def doctor_headers() -> dict[str, str]:
+    key = load_env(env_path()).get("API_KEY") or os.environ.get("API_KEY", "")
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     root = Path(__file__).resolve().parent.parent
     try:
@@ -283,6 +288,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     binary = tunnel.find_existing(settings.tools_dir)
     log(f"  {'OK' if binary else '?'}   cloudflared {binary or 'not downloaded yet'}")
     log(f"  tunnel mode {settings.tunnel_mode}")
+
+    head("Device registry")
+    log(f"  device    {settings.host_name}"
+        + ("" if os.environ.get("HOST_NAME") else "  (HOST_NAME unset; using the OS hostname)"))
+    log(f"  mongodb   {'configured' if settings.mongodb_uri else 'not set - links are not published'}")
+    if "api" in running:
+        code, payload = http_json(f"{settings.api_url}/v1/registry", headers=doctor_headers())
+        if code == 200 and isinstance(payload, dict) and payload.get("published"):
+            log(f"  published {payload.get('link')}")
+            log(f"            at {payload.get('updated_at')}")
+        elif code == 200 and isinstance(payload, dict):
+            log(f"  published nothing yet ({payload.get('target')})")
+        else:
+            log("  ?   could not read /v1/registry")
 
     head("Verdict")
     for warning in warnings:
@@ -395,11 +414,41 @@ def cmd_start(args: argparse.Namespace) -> int:
     log(f"  API       {settings.api_url}   (docs at /docs)")
     if public:
         log(f"  Public    {public}/v1/edit")
+        publish_device(settings, public)
     else:
         log("  Public    not exposed (TUNNEL_MODE=off)")
     log(f"  Logs      {runner.logs}")
     log("  Stop with qwen21 stop")
     return 0
+
+
+def publish_device(settings: config.Settings, public: str) -> bool:
+    """Record this device's public link in MongoDB.
+
+    Best effort on purpose: a registry outage must not turn a working endpoint
+    into a failed `qwen21 start`. Returns True when the link was published.
+    """
+    link = f"{public.rstrip('/')}/v1/edit"
+    key = load_env(env_path()).get("API_KEY") or os.environ.get("API_KEY", "")
+    if not key:
+        log("  ·   not published: API_KEY is not set")
+        return False
+    if not settings.mongodb_uri:
+        log(f"  ·   not published: MONGODB is not set (device '{settings.host_name}' unregistered)")
+        return False
+    code, payload = http_json(
+        f"{settings.api_url}/v1/internal/tunnel",
+        {"link": link},
+        headers={"Authorization": f"Bearer {key}"},
+        timeout=20,
+    )
+    if code == 200 and isinstance(payload, dict):
+        log(f"  ✓ registered as '{settings.host_name}' -> {payload.get('target', 'mongodb')}")
+        return True
+    detail = payload.get("detail") if isinstance(payload, dict) else payload
+    log(f"  ! could not register '{settings.host_name}': {detail}")
+    log("    the endpoint is live regardless; fix the registry and re-run `qwen21 tunnel`")
+    return False
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -468,10 +517,18 @@ def cmd_tunnel(args: argparse.Namespace) -> int:
     runner.start(service)
     if mode == "quick":
         url = tunnel.quick_tunnel_url(runner.log_file("tunnel"), timeout=60)
-        log(f"  public: {url}/v1/edit" if url else "  ! no hostname yet, check `qwen21 logs tunnel`")
-    else:
-        hostname = os.environ.get("TUNNEL_HOSTNAME")
-        log(f"  public: {tunnel.public_url('named', hostname)}/v1/edit")
+        if not url:
+            log("  ! no hostname yet, check `qwen21 logs tunnel`")
+            return 1
+        log(f"  public: {url}/v1/edit")
+        publish_device(settings, url)
+        return 0
+    public = tunnel.public_url("named", os.environ.get("TUNNEL_HOSTNAME"))
+    if not public:
+        log("  ! TUNNEL_HOSTNAME is not set; cannot print or publish the public URL")
+        return 1
+    log(f"  public: {public}/v1/edit")
+    publish_device(settings, public)
     return 0
 
 

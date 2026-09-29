@@ -7,6 +7,7 @@ set these variables.
 from __future__ import annotations
 
 import os
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +41,11 @@ class Settings:
     api_key: str
     allow_anonymous: bool
     public_base_url: str
+
+    # Device registry: which public link belongs to this machine.
+    host_name: str
+    mongodb_uri: str
+    mongodb_collection: str
 
     unet: str
     unet_gguf: bool
@@ -87,6 +93,13 @@ def load() -> Settings:
         api_key=os.environ.get("API_KEY", "").strip(),
         allow_anonymous=_bool("ALLOW_ANONYMOUS", False),
         public_base_url=os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/"),
+        # HOST_NAME is the key every device owns in the registry, so it has to
+        # survive restarts: the OS hostname is a stable fallback, .env wins.
+        host_name=(
+            os.environ.get("HOST_NAME", "").strip() or socket.gethostname()
+        ),
+        mongodb_uri=os.environ.get("MONGODB", "").strip(),
+        mongodb_collection=os.environ.get("MONGODB_COLLECTION", "devices").strip() or "devices",
         unet=os.environ.get("QWEN_UNET", "").strip(),
         unet_gguf=_bool("QWEN_UNET_GGUF", False),
         clip=os.environ.get("QWEN_CLIP", "").strip(),

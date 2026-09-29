@@ -44,6 +44,28 @@ KEYS: tuple[KeySpec, ...] = (
         where="any hostname on a zone that is already on Cloudflare DNS, e.g. img.example.com",
     ),
     KeySpec(
+        "HOST_NAME",
+        required=False,
+        why="Key this device owns in the MongoDB registry (defaults to the OS hostname).",
+        where="any stable name for this machine, e.g. m3-air or rtx4060-box",
+    ),
+    KeySpec(
+        "MONGODB",
+        required=False,
+        why="Publishes this device's public link to MongoDB so you can find it by name.",
+        where=(
+            "MongoDB Atlas -> Database Access -> add a user with read/write on the "
+            "database only -> 'Connect' -> copy the SRV connection string. "
+            "Keep the password out of git: .env is gitignored."
+        ),
+    ),
+    KeySpec(
+        "MONGODB_COLLECTION",
+        required=False,
+        why="Collection that holds one document per device (default: devices).",
+        where="any collection name; the document schema is {link, device, updated_at}",
+    ),
+    KeySpec(
         "HF_TOKEN",
         required=False,
         why="Raises Hugging Face download limits; required only for gated repositories.",
