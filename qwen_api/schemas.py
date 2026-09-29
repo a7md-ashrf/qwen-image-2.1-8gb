@@ -26,6 +26,14 @@ class SampleParams(BaseModel):
         description="block until the job finishes; falls back to 202 + job id on timeout",
     )
     n: int = Field(1, ge=1, le=4)
+    response_format: str | None = Field(
+        None,
+        pattern="^(b64|url)$",
+        description=(
+            "b64 embeds the image in the JSON (default); url returns only the "
+            "download URL, which avoids the 33%% base64 inflation on large results"
+        ),
+    )
 
     @field_validator("prompt")
     @classmethod

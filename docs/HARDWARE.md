@@ -91,6 +91,24 @@ throughput, keep `mac-8gb` and be patient, or use `full` on a bigger machine.
 Free memory before a run: quit Safari tabs, stop Docker/VMs, and make sure
 "App Nap"/heavy Spotlight indexing is not running during the first job.
 
+## Memory budget
+
+The service holds rendered images **in RAM only** — nothing is written to disk
+(see [API.md](API.md#images-are-never-written-to-disk)). That budget comes out of
+the same 8 GB (or shared memory) that ComfyUI is already using, so:
+
+| | default | note |
+|---|---|---|
+| `IMAGE_CACHE_MB` | 64 | about 30 x 1024px PNGs, or ~6 x 2K ones |
+| worst-case request | 80 MB | `MAX_UPLOAD_MB` 20 x `MAX_IMAGES` 4 |
+| ComfyUI image dirs | `runtime/comfy/{input,output,temp}` | emptied per request |
+
+64 MB is deliberately modest: an over-budget image is still returned in the
+response, it is simply not retained for a later fetch (the client sees
+`retained: false` and the URL answers `410`). Raise it if you have headroom, and
+lower it on a machine that is already swapping. `MAX_CONCURRENT=1` bounds the
+pressure further, since only one job runs at a time.
+
 ## Measuring your own numbers
 
 ```bash

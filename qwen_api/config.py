@@ -61,6 +61,8 @@ class Settings:
     default_sampler: str
     default_scheduler: str
 
+    max_request_mb: float
+    response_format: str
     sync_max_wait: float
     max_concurrent: int
     max_queue: int
@@ -70,19 +72,35 @@ class Settings:
     max_upload_mb: float
     max_images: int
     poll_interval: float
-    output_dir: Path
+    db_path: Path
+    image_cache_mb: float
+    keep_image_files: bool
+    orphan_max_age_min: float
 
     @property
     def max_upload_bytes(self) -> int:
         return int(self.max_upload_mb * 1024 * 1024)
 
+    @property
+    def max_request_bytes(self) -> int:
+        return int(self.max_request_mb * 1024 * 1024)
 
-def output_dir_default() -> Path:
-    override = os.environ.get("QWEN_OUTPUT_DIR")
-    if override:
-        return Path(override).expanduser()
-    here = Path(__file__).resolve().parent.parent
-    return here / "runtime" / "outputs"
+    @property
+    def worst_case_request_bytes(self) -> int:
+        """Largest request the current per-file/count settings would allow."""
+        return self.max_upload_bytes * self.max_images
+
+
+def runtime_path(*parts: str) -> Path:
+    override = os.environ.get("QWEN_RUNTIME_DIR")
+    here = Path(override).expanduser() if override else Path(__file__).resolve().parent.parent / "runtime"
+    return here.joinpath(*parts)
+
+
+def db_path_default() -> Path:
+    """The only file the service writes: job metadata, never image bytes."""
+    override = os.environ.get("QWEN_JOB_DB")
+    return Path(override).expanduser() if override else runtime_path("jobs.sqlite3")
 
 
 def load() -> Settings:
@@ -112,18 +130,28 @@ def load() -> Settings:
         default_cfg=_float("QWEN_DEFAULT_CFG", 1.0),
         default_sampler=os.environ.get("QWEN_DEFAULT_SAMPLER", "euler"),
         default_scheduler=os.environ.get("QWEN_DEFAULT_SCHEDULER", "simple"),
-        # Cloudflare's proxy drops origin responses after ~100s of silence, so a
-        # blocking request must give up before that and hand back a job id.
+        # Cloudflare's proxy read timeout is 125 s (524). Give up before that
+        # and hand back a job id instead of being cut off mid-generation.
         sync_max_wait=_float("SYNC_MAX_WAIT", 90.0),
+        # Free/Pro cap *request* bodies at 100 MB, Business at 200 MB. Default
+        # under the smallest cap so our own 413 arrives with a useful message
+        # instead of an opaque Cloudflare error page.
+        max_request_mb=_float("MAX_REQUEST_MB", 90.0),
+        response_format=os.environ.get("RESPONSE_FORMAT", "b64").strip().lower() or "b64",
         max_concurrent=_int("MAX_CONCURRENT", 1),
         max_queue=_int("MAX_QUEUE", 8),
         job_timeout=_float("JOB_TIMEOUT", 3600.0),
         job_ttl_hours=_float("JOB_TTL_HOURS", 24.0),
         rate_limit_per_min=_float("RATE_LIMIT_PER_MIN", 10.0),
-        max_upload_mb=_float("MAX_UPLOAD_MB", 25.0),
+        max_upload_mb=_float("MAX_UPLOAD_MB", 20.0),
         max_images=_int("MAX_IMAGES", 4),
         poll_interval=_float("POLL_INTERVAL", 1.5),
-        output_dir=output_dir_default(),
+        db_path=db_path_default(),
+        # Rendered images are held in RAM, never written to disk. This bounds how
+        # much of the 8GB the service may take back for the async 202 path.
+        image_cache_mb=_float("IMAGE_CACHE_MB", 64.0),
+        keep_image_files=_bool("KEEP_IMAGE_FILES", False),
+        orphan_max_age_min=_float("ORPHAN_MAX_AGE_MIN", 60.0),
     )
 
 

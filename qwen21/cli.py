@@ -289,6 +289,28 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     log(f"  {'OK' if binary else '?'}   cloudflared {binary or 'not downloaded yet'}")
     log(f"  tunnel mode {settings.tunnel_mode}")
 
+    head("Transport limits")
+    ceiling = _float_env("MAX_REQUEST_MB", 90.0)
+    per_file = _float_env("MAX_UPLOAD_MB", 20.0)
+    images = _int_env("MAX_IMAGES", 4)
+    worst = per_file * images
+    log(f"  request ceiling  {ceiling:.0f} MB   (Cloudflare caps uploads at 100 MB on Free/Pro)")
+    log(f"  worst case       {worst:.0f} MB   ({per_file:.0f} MB x {images} images)")
+    if worst > ceiling:
+        failures.append(
+            f"MAX_UPLOAD_MB x MAX_IMAGES ({worst:.0f} MB) exceeds MAX_REQUEST_MB "
+            f"({ceiling:.0f} MB): requests would be refused by this service before "
+            "Cloudflare ever saw them"
+        )
+    if ceiling > 100 and settings.tunnel_mode != "off":
+        warnings.append(
+            f"MAX_REQUEST_MB is {ceiling:.0f} MB; a Cloudflare Free/Pro account "
+            "returns 413 at 100 MB regardless"
+        )
+    log(f"  image cache      {_float_env('IMAGE_CACHE_MB', 64.0):.0f} MB in RAM, "
+        "no image files are written")
+    log(f"  comfy image dirs {settings.comfy_dirs['output']}")
+
     head("Device registry")
     log(f"  device    {settings.host_name}"
         + ("" if os.environ.get("HOST_NAME") else "  (HOST_NAME unset; using the OS hostname)"))
@@ -329,6 +351,15 @@ def _comfy_service(settings: config.Settings) -> Service:
         settings.comfy_host,
         "--port",
         str(settings.comfy_port),
+        # Own the image directories: ComfyUI has no way to delete an output and
+        # does not report its paths, so the service must know them up front to
+        # leave nothing behind. See qwen_api/storage.py.
+        "--input-directory",
+        str(settings.comfy_dirs["input"]),
+        "--output-directory",
+        str(settings.comfy_dirs["output"]),
+        "--temp-directory",
+        str(settings.comfy_dirs["temp"]),
         *settings.profile.comfy_args,
     ]
     return Service(
@@ -385,6 +416,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     mode = args.tunnel or settings.tunnel_mode
     head("Starting")
+    sweep_orphans(settings, runner)
     if not runner.start(_comfy_service(settings)):
         return die(
             f"ComfyUI did not come up on {settings.comfy_url}. "
@@ -449,6 +481,51 @@ def publish_device(settings: config.Settings, public: str) -> bool:
     log(f"  ! could not register '{settings.host_name}': {detail}")
     log("    the endpoint is live regardless; fix the registry and re-run `qwen21 tunnel`")
     return False
+
+
+def sweep_orphans(settings: config.Settings, runner: Runner) -> int:
+    """Delete image files a previous crash left in ComfyUI's directories.
+
+    Only safe just before we launch ComfyUI, and only when it is not already
+    running: age-based, so nothing a fresh render just wrote is at risk.
+    """
+    if runner.pid("comfy"):
+        return 0
+    if os.environ.get("KEEP_IMAGE_FILES", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return 0
+    max_age = _float_env("ORPHAN_MAX_AGE_MIN", 60.0) * 60
+    removed = 0
+    for directory in settings.comfy_dirs.values():
+        if not directory.is_dir():
+            continue
+        now = time.time()
+        for path in directory.rglob("*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            try:
+                if now - path.stat().st_mtime < max_age:
+                    continue
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+    if removed:
+        log(f"  ✓ removed {removed} leftover image file(s) from a previous run")
+    return removed
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def cmd_stop(args: argparse.Namespace) -> int:

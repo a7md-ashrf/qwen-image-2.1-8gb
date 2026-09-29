@@ -286,7 +286,16 @@ class TestApiConfig(unittest.TestCase):
         settings = self._load()
         # Cloudflare's proxy read timeout is 125 s (524). We must give up first.
         self.assertLess(settings.sync_max_wait, 125.0)
-        self.assertEqual(settings.max_upload_bytes, 25 * 1024 * 1024)
+
+    def test_upload_defaults_stay_under_the_tunnel_ceiling(self):
+        settings = self._load()
+        mb = 1024 * 1024
+        # Free/Pro cap a request body at 100 MB, so the default ceiling is 90
+        # and the per-file/count defaults must fit inside it.
+        self.assertEqual(settings.max_request_bytes, 90 * mb)
+        self.assertEqual(settings.max_upload_mb, 20.0)
+        self.assertLessEqual(settings.worst_case_request_bytes, settings.max_request_bytes)
+        self.assertLessEqual(settings.worst_case_request_bytes, 100 * mb)
 
     def test_registry_settings_come_from_the_environment(self):
         settings = self._load(HOST_NAME="rtx4060-box", MONGODB="mongodb+srv://u:p@h/db",
@@ -311,7 +320,7 @@ class TestJobs(unittest.TestCase):
         from qwen_api.jobs import JobStore
 
         self.tmp = tempfile.TemporaryDirectory()
-        self.store = JobStore(Path(self.tmp.name), ttl_hours=1.0)
+        self.store = JobStore(Path(self.tmp.name) / "jobs.sqlite3", ttl_hours=1.0)
 
     def tearDown(self):
         self.store.close()
@@ -321,8 +330,8 @@ class TestJobs(unittest.TestCase):
         from qwen_api.jobs import SUCCEEDED, JobStore
 
         job = self.store.create("edit", {"prompt": "x"})
-        self.store.update(job, status=SUCCEEDED, images=[{"index": 0, "path": "x.png"}])
-        reopened = JobStore(Path(self.tmp.name), ttl_hours=1.0)
+        self.store.update(job, status=SUCCEEDED, images=[{"index": 0, "bytes": 3}])
+        reopened = JobStore(Path(self.tmp.name) / "jobs.sqlite3", ttl_hours=1.0)
         try:
             restored = reopened.get(job.id)
             self.assertIsNotNone(restored)
@@ -335,7 +344,7 @@ class TestJobs(unittest.TestCase):
         from qwen_api.jobs import FAILED, JobStore
 
         self.store.create("edit")
-        reopened = JobStore(Path(self.tmp.name), ttl_hours=1.0)
+        reopened = JobStore(Path(self.tmp.name) / "jobs.sqlite3", ttl_hours=1.0)
         try:
             job = reopened.list()[0]
             self.assertEqual(job.status, FAILED)

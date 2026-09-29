@@ -73,6 +73,20 @@ class Settings:
     def tools_dir(self) -> Path:
         return runtime_dir() / "tools"
 
+    @property
+    def comfy_dirs(self) -> dict[str, Path]:
+        """Where ComfyUI may write images.
+
+        We own these, so the service can delete exactly what it created and a
+        crash sweep can never touch a file a user put there on purpose.
+        """
+        base = runtime_dir() / "comfy"
+        return {
+            "input": base / "input",
+            "output": base / "output",
+            "temp": base / "temp",
+        }
+
     def api_env(self) -> dict[str, str]:
         """Environment handed to the API process."""
         return {
@@ -99,6 +113,9 @@ class Settings:
             "QWEN_DEFAULT_CFG": str(self.profile.cfg),
             "QWEN_DEFAULT_SAMPLER": self.profile.sampler,
             "QWEN_DEFAULT_SCHEDULER": self.profile.scheduler,
+            "QWEN_COMFY_INPUT_DIR": str(self.comfy_dirs["input"]),
+            "QWEN_COMFY_OUTPUT_DIR": str(self.comfy_dirs["output"]),
+            "QWEN_COMFY_TEMP_DIR": str(self.comfy_dirs["temp"]),
         }
 
 

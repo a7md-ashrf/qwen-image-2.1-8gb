@@ -87,6 +87,10 @@ own. Details and honest expectations: [docs/HARDWARE.md](docs/HARDWARE.md).
 | `qwen21 serve` / `qwen21 comfy` | run just the API / just ComfyUI, in the foreground |
 | `python scripts/check_secrets.py` | fail if a real credential is in a tracked file |
 
+Images are never written to disk: the service returns them from RAM and deletes
+everything ComfyUI wrote for the request, so nothing is left behind. See
+[docs/API.md](docs/API.md#images-are-never-written-to-disk).
+
 ## Public endpoint
 
 Default is a Cloudflare **quick tunnel**: no account, no DNS, a random

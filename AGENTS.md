@@ -84,6 +84,25 @@ timeout is 125 s; a 25-step edit takes longer than that on this hardware.
 - The `TextEncodeQwenImage21` autogrow input is a **dict of slot → link** in API
   format, not a dotted `images.image_1` input.
 
+## Images never touch disk
+The service is **memory-only** for rendered images (`IMAGE_CACHE_MB`, 64 MB); the
+only file it writes is `runtime/jobs.sqlite3`. `qwen21` therefore launches ComfyUI
+with `--input-directory`/`--output-directory`/`--temp-directory` under
+`runtime/comfy/`, and `qwen_api/storage.py` deletes ComfyUI's render the moment it
+is read plus any file *we* uploaded when the job ends. Traps:
+- **ComfyUI 0.37.0 cannot delete an output and does not report its paths**
+  (`delete_history_item` only pops the in-memory record; there is no `unlink` in
+  `server.py`). We own the directories so we can clean up. Never point those
+  flags at a directory holding files a user cares about.
+- Sweep by **age**, never blanket-delete, or a sweep can delete a live render.
+- A filename referenced through `/v1/edit` (`-F "image=photo.png"`) belongs to
+  the caller: only names the service uploaded are deleted.
+- FastAPI hands back **starlette**'s `UploadFile`, which is not an instance of
+  `fastapi.UploadFile`; classify parts by `isinstance(x, str)` and duck-type the
+  rest.
+- `MAX_REQUEST_MB` (90) exists because Cloudflare caps request bodies at 100 MB
+  on Free/Pro; `doctor` fails if `MAX_UPLOAD_MB x MAX_IMAGES` exceeds it.
+
 ## Device registry (optional)
 A quick tunnel hostname is random per restart, so `HOST_NAME` (default: OS
 hostname) is the stable key. `qwen21 start` POSTs the live link to
@@ -95,15 +114,6 @@ the URI is never logged; and the registry is **best-effort**, so a Mongo outage
 returns 503 on the publish route and never affects the endpoint.
 `scripts/check_secrets.py` fails the build if a real credential reaches a
 tracked file — its own test fixtures are assembled from parts for that reason.
-
-## Pending, agreed but not implemented
-Cloudflare request-size ceiling: Free/Pro cap uploads at **100 MB** (Business
-200 MB), while the current defaults allow `MAX_UPLOAD_MB=25 × MAX_IMAGES=4` =
-100 MB of image data + multipart overhead. Plan: a `MAX_REQUEST_MB` (90) total
-ceiling enforced from `Content-Length` and while streaming, `MAX_UPLOAD_MB` down
-to 20, a `response_format` (`b64` | `url`) option, filename mode to reference a
-file already in `ComfyUI/input/`, and doc corrections (125 s read timeout,
-30 s write timeout).
 
 ## Commands
 ```

@@ -3,6 +3,12 @@
 ComfyUI serialises execution on its own queue, so this module does not run a
 worker pool - it hands a prompt to ComfyUI and watches the history. Its jobs are
 what turns a long generation into a pollable, restart-survivable id.
+
+**Rendered images live in RAM, never on disk.** Each job keeps its image bytes in
+a bounded LRU cache (`IMAGE_CACHE_MB`, 64 MB by default) so that the async 202
+path can still hand them over when the client polls. The SQLite mirror keeps
+metadata only - after a restart the bytes are gone by design and the job reports
+`retained: false`.
 """
 from __future__ import annotations
 
@@ -57,6 +63,8 @@ class Job:
     request: dict[str, Any] = field(default_factory=dict)
     task: asyncio.Task | None = field(default=None, repr=False, compare=False)
     done: asyncio.Event = field(default_factory=asyncio.Event, repr=False, compare=False)
+    # {index: bytes} for this job only. Never persisted, never serialised.
+    blobs: dict[int, bytes] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def elapsed(self) -> float:
@@ -68,15 +76,33 @@ class Job:
                 return entry
         return None
 
+    def blob(self, index: int) -> bytes | None:
+        """The image bytes, or None once evicted or after a restart."""
+        if not self.blobs:
+            return None
+        return self.blobs.get(index)
+
 
 class JobStore:
-    def __init__(self, output_dir: Path, ttl_hours: float = 24.0) -> None:
-        self.output_dir = output_dir
+    """Jobs plus a bounded in-RAM image cache. Writes no image files.
+
+    `db_path` is the only thing that ever touches the filesystem.
+    """
+
+    def __init__(
+        self,
+        db_path: Path,
+        ttl_hours: float = 24.0,
+        image_cache_mb: float = 64.0,
+    ) -> None:
+        self.db_path = db_path
         self.ttl = ttl_hours * 3600
+        self.cache_budget = max(0, int(image_cache_mb * 1024 * 1024))
+        self._cached_bytes = 0
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(output_dir / "jobs.sqlite3", check_same_thread=False)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.executescript(SCHEMA)
         self._db.commit()
         self._restore()
@@ -103,6 +129,11 @@ class JobStore:
                 images=json.loads(images),
                 request=json.loads(request),
             )
+            # Nothing from the old process can be retained: the bytes died with
+            # it, so say so up front rather than 404-ing at poll time.
+            for entry in job.images:
+                entry.pop("path", None)
+                entry["retained"] = False
             if status in TERMINAL:
                 job.done.set()
             else:
@@ -141,8 +172,68 @@ class JobStore:
         job = Job(id=uuid.uuid4().hex[:24], kind=kind, request=request or {})
         self._jobs[job.id] = job
         self._persist(job)
-        (self.output_dir / job.id).mkdir(parents=True, exist_ok=True)
         return job
+
+    # ------------------------------------------------------------- RAM cache
+
+    @property
+    def cached_bytes(self) -> int:
+        return self._cached_bytes
+
+    def cache_images(self, job: Job, blobs: dict[int, bytes]) -> list[int]:
+        """Try to retain `blobs` for later polling.
+
+        Never raises and never fails the request: an image that does not fit is
+        simply not retained, and the response that is about to be built still
+        has the bytes. Returns the indices that were kept.
+        """
+        kept: list[int] = []
+        for index, data in blobs.items():
+            if len(data) > self.cache_budget or self.cache_budget == 0:
+                self._mark_unretained(job, index)
+                continue
+            while self._cached_bytes + len(data) > self.cache_budget:
+                if not self._evict_oldest(protect=job.id):
+                    break
+            if self._cached_bytes + len(data) > self.cache_budget:
+                self._mark_unretained(job, index)
+                continue
+            job.blobs[index] = data
+            self._cached_bytes += len(data)
+            kept.append(index)
+        self._mark_retained(job, kept)
+        return kept
+
+    def _evict_oldest(self, protect: str | None = None) -> bool:
+        """Drop the least recently updated job's images. True if something went."""
+        candidates = [
+            job for job in self._jobs.values()
+            if job.blobs and job.id != protect and job.status in TERMINAL
+        ]
+        if not candidates:
+            candidates = [job for job in self._jobs.values()
+                          if job.blobs and job.id != protect]
+        if not candidates:
+            return False
+        victim = min(candidates, key=lambda j: j.updated_at)
+        self._forget_blobs(victim)
+        return True
+
+    def _forget_blobs(self, job: Job) -> None:
+        for index in list(job.blobs):
+            self._cached_bytes -= len(job.blobs.pop(index))
+        self._mark_unretained(job, [i.get("index", n) for n, i in enumerate(job.images)])
+
+    @staticmethod
+    def _mark_retained(job: Job, indices: list[int]) -> None:
+        for entry in job.images:
+            entry["retained"] = entry.get("index", 0) in indices
+
+    @staticmethod
+    def _mark_unretained(job: Job, index: int) -> None:
+        entry = job.image(index)
+        if entry is not None:
+            entry["retained"] = False
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
@@ -200,15 +291,11 @@ class JobStore:
         return job.status in TERMINAL
 
     def sweep(self) -> int:
-        """Delete expired jobs and their files. Returns how many were removed."""
+        """Forget expired jobs and their cached images. Returns how many."""
         cutoff = time.time() - self.ttl
         stale = [j for j in self._jobs.values() if j.updated_at < cutoff]
         for job in stale:
-            folder = self.output_dir / job.id
-            if folder.is_dir():
-                for item in folder.glob("*"):
-                    item.unlink(missing_ok=True)
-                folder.rmdir()
+            self._forget_blobs(job)
             self._jobs.pop(job.id, None)
         if stale:
             placeholders = ",".join("?" * len(stale))

@@ -47,13 +47,25 @@ MODELS = {
 class FakeState:
     """Knobs the tests turn to simulate a slow or a broken ComfyUI."""
 
-    def __init__(self) -> None:
+    def __init__(self, root: Path | None = None) -> None:
         self.history_calls = 0
         self.history_delay = 0
         self.fail_with: dict | None = None
         self.last_prompt: dict = {}
         self.prompts: list[dict] = []
         self.uploads = 0
+        self.empty_models = False
+        # ComfyUI is file-based: it writes uploads to input/ and renders to
+        # output/. The fake does the same so the tests can prove the service
+        # cleans up after itself.
+        self.root = root
+
+    def write(self, folder: str, name: str) -> str:
+        assert self.root is not None
+        target = self.root / folder
+        target.mkdir(parents=True, exist_ok=True)
+        (target / name).write_bytes(PNG_1PX)
+        return name
 
 
 class FakeComfyUI(BaseHTTPRequestHandler):
@@ -74,36 +86,29 @@ class FakeComfyUI(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
-        if path == "/system_stats":
-            return self._send({"devices": [{"name": "Fake GPU", "vram_total": 8 * 2**30}]})
         if path.startswith("/models/"):
-            return self._send(MODELS.get(path.split("/")[-1], []))
+            folder = path.split("/")[-1]
+            return self._send([] if self.state.empty_models else MODELS.get(folder, []))
         if path.startswith("/object_info/"):
             return self._send({path.split("/")[-1]: {}})
         if path.startswith("/history/"):
             self.state.history_calls += 1
             if self.state.history_calls <= self.state.history_delay:
                 return self._send({})
+            name = self.state.write("output", f"render-{self.state.history_calls}.png")
             return self._send(
                 {
                     path.split("/")[-1]: {
                         "status": {"status_str": "success", "messages": []},
-                        "outputs": {
-                            "60": {
-                                "images": [
-                                    {
-                                        "filename": "out.png",
-                                        "subfolder": "",
-                                        "type": "output",
-                                    }
-                                ]
-                            }
-                        },
+                        "outputs": {"60": {"images": [{"filename": name, "subfolder": "",
+                                                      "type": "output"}]}},
                     }
                 }
             )
         if path == "/view":
             return self._send(PNG_1PX, "image/png")
+        if path == "/system_stats":
+            return self._send({"devices": [{"name": "Fake GPU", "vram_total": 8 * 2**30}]})
         if path == "/queue":
             return self._send({"queue_running": [], "queue_pending": []})
         return self._send({"error": "not found"}, status=404)
@@ -140,6 +145,15 @@ RESET_KEYS = (
     "RATE_LIMIT_PER_MIN",
     "MAX_QUEUE",
     "MAX_IMAGES",
+    "MAX_REQUEST_MB",
+    "MAX_UPLOAD_MB",
+    "RESPONSE_FORMAT",
+    "IMAGE_CACHE_MB",
+    "KEEP_IMAGE_FILES",
+    "QWEN_COMFY_DIR",
+    "QWEN_COMFY_INPUT_DIR",
+    "QWEN_COMFY_OUTPUT_DIR",
+    "QWEN_COMFY_TEMP_DIR",
     "ALLOW_ANONYMOUS",
     "QWEN_UNET",
     "QWEN_CLIP",
@@ -149,7 +163,7 @@ RESET_KEYS = (
 )
 
 
-def load_app(comfy_url: str, output_dir: str, **env: str):
+def load_app(comfy_url: str, output_dir: str, comfy_root: str, **env: str):
     """Import a fresh copy of the app with exactly this environment."""
     previous = sys.modules.get("qwen_api.app")
     if previous is not None and hasattr(previous, "store"):
@@ -162,7 +176,10 @@ def load_app(comfy_url: str, output_dir: str, **env: str):
         {
             "COMFY_URL": comfy_url,
             "API_KEY": "test-key",
-            "QWEN_OUTPUT_DIR": output_dir,
+            "QWEN_JOB_DB": str(Path(output_dir) / "jobs.sqlite3"),
+            "QWEN_COMFY_INPUT_DIR": str(Path(comfy_root) / "input"),
+            "QWEN_COMFY_OUTPUT_DIR": str(Path(comfy_root) / "output"),
+            "QWEN_COMFY_TEMP_DIR": str(Path(comfy_root) / "temp"),
             "SYNC_MAX_WAIT": "5",
             "RATE_LIMIT_PER_MIN": "0",
             **env,
@@ -183,9 +200,10 @@ class ApiTestCase(unittest.TestCase):
         cls.thread.start()
         cls.comfy_url = f"http://127.0.0.1:{cls.server.server_address[1]}"
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.state = FakeState()
+        cls.comfy = tempfile.TemporaryDirectory()
+        cls.state = FakeState(Path(cls.comfy.name))
         FakeComfyUI.state = cls.state
-        cls.module = load_app(cls.comfy_url, cls.tmp.name, **cls.env)
+        cls.module = load_app(cls.comfy_url, cls.tmp.name, cls.comfy.name, **cls.env)
 
     @classmethod
     def tearDownClass(cls):
@@ -194,12 +212,15 @@ class ApiTestCase(unittest.TestCase):
         cls.tmp.cleanup()
 
     def setUp(self):
-        FakeComfyUI.state = self.state.__class__()
-        self.state = FakeComfyUI.state
-        # A per-test output dir: the job database is a file, and a shared one
-        # would leak jobs between tests.
+        # Per-test dirs: the job database is a file, and ComfyUI's image tree
+        # must not leak between tests.
         self.tmp = tempfile.TemporaryDirectory()
-        self.module = load_app(self.comfy_url, self.tmp.name, **self.env)
+        self.comfy = tempfile.TemporaryDirectory()
+        self.state = FakeState(Path(self.comfy.name))
+        FakeComfyUI.state = self.state
+        self.module = load_app(
+            self.comfy_url, self.tmp.name, self.comfy.name, **self.env
+        )
         # Entering the context manager starts the lifespan and keeps ONE event
         # loop for the whole test, so background jobs survive between requests
         # exactly as they do under uvicorn.
@@ -209,6 +230,10 @@ class ApiTestCase(unittest.TestCase):
     def tearDown(self):
         self._client.__exit__(None, None, None)
         self.tmp.cleanup()
+        self.comfy.cleanup()
+
+    def comfy_files(self) -> list[Path]:
+        return sorted(p for p in Path(self.comfy.name).rglob("*") if p.is_file())
 
     def post_edit(self, **fields):
         return self.client.post(
@@ -332,7 +357,8 @@ class TestAuthAndLimits(ApiTestCase):
         self.assertEqual(response.status_code, 200)
 
     def test_a_full_queue_is_refused_before_uploading(self):
-        module = load_app(self.comfy_url, self.tmp.name, MAX_QUEUE="0", **self.env)
+        module = load_app(self.comfy_url, self.tmp.name, self.comfy.name,
+                          MAX_QUEUE="0", **self.env)
         with TestClient(module.app) as client:
             response = client.post(
                 "/v1/edit",
@@ -345,7 +371,8 @@ class TestAuthAndLimits(ApiTestCase):
         self.assertEqual(self.state.uploads, 0)
 
     def test_rate_limit_returns_429(self):
-        module = load_app(self.comfy_url, self.tmp.name, RATE_LIMIT_PER_MIN="1", **self.env)
+        module = load_app(self.comfy_url, self.tmp.name, self.comfy.name,
+                          RATE_LIMIT_PER_MIN="1", **self.env)
         with TestClient(module.app) as client:
             first = client.get("/v1/models", headers=self.auth)
             second = client.get("/v1/models", headers=self.auth)
@@ -396,6 +423,249 @@ class FakeCollection:
 
     async def find_one(self, query, projection=None):
         return self.documents.get(query["device"])
+
+
+class TestNoImageFilesAreLeftBehind(ApiTestCase):
+    """ComfyUI writes images to disk; the service must leave nothing behind."""
+
+    def test_a_completed_edit_leaves_no_files_anywhere(self):
+        response = self.post_edit(prompt="x")
+        self.assertEqual(response.status_code, 200, response.text)
+        # the fake really did write an upload and a render
+        self.assertEqual(self.state.uploads, 1)
+        self.assertEqual(self.comfy_files(), [], "image files survived the request")
+
+    def test_no_output_directory_is_created_at_all(self):
+        self.post_edit(prompt="x")
+        self.assertFalse((Path(self.tmp.name) / "outputs").exists())
+
+    def test_the_response_still_carries_the_bytes(self):
+        import base64
+
+        body = self.post_edit(prompt="x").json()
+        self.assertEqual(base64.b64decode(body["images"][0]["b64_json"]), PNG_1PX)
+        self.assertTrue(body["images"][0]["retained"])
+        self.assertEqual(self.comfy_files(), [])
+
+    def test_a_failed_job_leaves_nothing_behind(self):
+        self.state.fail_with = {"error": {"message": "no"}}
+        response = self.post_edit(prompt="x")
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(self.comfy_files(), [])
+
+    def test_a_cancelled_job_leaves_nothing_behind(self):
+        self.state.history_delay = 50  # still "running" when we cancel
+        response = self.post_edit(prompt="x", wait="false")
+        job_id = response.json()["id"]
+        self.client.post(f"/v1/jobs/{job_id}/cancel", headers=self.auth)
+        for _ in range(50):
+            if not self.comfy_files():
+                break
+            import time as _t
+
+            _t.sleep(0.05)
+        self.assertEqual(self.comfy_files(), [])
+
+    def test_many_images_leave_nothing_behind(self):
+        response = self.post_edit(prompt="x", n="3")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["images"]), 3)
+        self.assertEqual(self.comfy_files(), [])
+
+    def test_a_part_refused_halfway_through_cleans_up_its_predecessors(self):
+        response = self.client.post(
+            "/v1/edit",
+            files=[
+                ("image", ("ok.png", PNG_1PX, "image/png")),
+                ("image", ("notes.txt", b"not an image", "text/plain")),
+            ],
+            data={"prompt": "x"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 415, response.text)
+        self.assertEqual(self.state.uploads, 1, "the first part really was uploaded")
+        self.assertEqual(self.comfy_files(), [], "the upload must be cleaned up")
+
+    def test_the_model_lookup_happens_before_any_upload(self):
+        # No model files at all: the service must fail before touching the wire,
+        # so there is no upload to leak and no bandwidth wasted.
+        self.state.empty_models = True
+        response = self.client.post(
+            "/v1/edit",
+            files={"image": ("a.png", PNG_1PX, "image/png")},
+            data={"prompt": "x"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertIn("no model file for", response.json()["detail"])
+        self.assertEqual(self.state.uploads, 0)
+        self.assertEqual(self.comfy_files(), [])
+
+    def test_an_orphan_from_a_crash_is_swept_by_age(self):
+        import os
+        import time
+
+        old = Path(self.comfy.name) / "output"
+        old.mkdir(parents=True, exist_ok=True)
+        stale = old / "leftover.png"
+        stale.write_bytes(PNG_1PX)
+        fresh = old / "in-flight.png"
+        fresh.write_bytes(PNG_1PX)
+        os.utime(stale, (time.time() - 7200, time.time() - 7200))
+
+        self.module.storage.sweep(3600)
+        self.assertFalse(stale.exists(), "an old orphan should be removed")
+        self.assertTrue(fresh.exists(), "a file from a live render must survive")
+
+    def test_reference_mode_touches_nothing(self):
+        target = Path(self.comfy.name) / "input"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "already-there.png").write_bytes(PNG_1PX)
+        response = self.client.post(
+            "/v1/edit",
+            files={"image": (None, "already-there.png")},
+            data={"prompt": "x"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.state.uploads, 0, "reference mode must not upload")
+        self.assertTrue((target / "already-there.png").exists(), "a file we did not create stays")
+
+
+class TestResponseFormat(ApiTestCase):
+    def test_url_format_omits_the_base64_payload(self):
+        body = self.post_edit(prompt="x", response_format="url").json()
+        self.assertNotIn("b64_json", body["images"][0])
+        self.assertTrue(body["images"][0]["url"].endswith("/image/0"))
+
+    def test_b64_is_the_default(self):
+        self.assertIn("b64_json", self.post_edit(prompt="x").json()["images"][0])
+
+    def test_an_invalid_format_is_refused(self):
+        self.assertEqual(self.post_edit(prompt="x", response_format="raw").status_code, 422)
+
+    def test_generate_accepts_url_too(self):
+        response = self.client.post(
+            "/v1/generate", json={"prompt": "x", "response_format": "url"}, headers=self.auth
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn("b64_json", response.json()["images"][0])
+
+
+class TestRequestSizeCeiling(ApiTestCase):
+    env = {"MAX_REQUEST_MB": "1", "MAX_UPLOAD_MB": "1", "MAX_IMAGES": "4"}
+
+    def test_content_length_over_the_ceiling_is_refused_before_anything_happens(self):
+        big = b"\x89PNG\r\n\x1a\n" + b"0" * (2 * 1024 * 1024)
+        response = self.client.post(
+            "/v1/edit",
+            files={"image": ("big.png", big, "image/png")},
+            data={"prompt": "x"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 413, response.text)
+        self.assertIn("this service accepts", response.json()["detail"])
+        self.assertEqual(self.state.uploads, 0, "nothing should be uploaded")
+        self.assertEqual(self.comfy_files(), [])
+
+    def test_the_message_names_the_cloudflare_cap(self):
+        big = b"\x89PNG\r\n\x1a\n" + b"0" * (2 * 1024 * 1024)
+        response = self.client.post(
+            "/v1/edit",
+            files={"image": ("big.png", big, "image/png")},
+            data={"prompt": "x"},
+            headers=self.auth,
+        )
+        self.assertIn("100 MB", response.json()["detail"])
+
+    def test_a_request_under_the_ceiling_still_works(self):
+        response = self.post_edit(prompt="x")
+        self.assertEqual(response.status_code, 200, response.text)
+
+
+class TestFilenameMode(ApiTestCase):
+    def test_an_existing_file_is_referenced_not_uploaded(self):
+        target = Path(self.comfy.name) / "input"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "photo.png").write_bytes(PNG_1PX)
+        response = self.client.post(
+            "/v1/edit",
+            files={"image": (None, "photo.png")},
+            data={"prompt": "x"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.state.uploads, 0)
+        self.assertEqual(
+            self.state.last_prompt["30"]["inputs"]["images"], {"image_1": ["100", 0]}
+        )
+
+    def test_a_file_that_is_not_there_is_refused(self):
+        response = self.client.post(
+            "/v1/edit",
+            files={"image": (None, "nope.png")},
+            data={"prompt": "x"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("input directory", response.json()["detail"])
+
+    def test_path_traversal_is_refused(self):
+        for name in ("../secrets.png", "/etc/passwd", "..\\secrets.png", "a/b.png"):
+            with self.subTest(name=name):
+                response = self.client.post(
+                    "/v1/edit",
+                    files={"image": (None, name)},
+                    data={"prompt": "x"},
+                    headers=self.auth,
+                )
+                self.assertEqual(response.status_code, 400, name)
+
+    def test_mixing_uploads_and_names_is_refused(self):
+        target = Path(self.comfy.name) / "input"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "photo.png").write_bytes(PNG_1PX)
+        response = self.client.post(
+            "/v1/edit",
+            files=[
+                ("image", (None, "photo.png")),
+                ("image", ("upload.png", PNG_1PX, "image/png")),
+            ],
+            data={"prompt": "x"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("mixing", response.json()["detail"])
+
+    def test_reference_mode_needs_the_api_key_too(self):
+        response = self.client.post(
+            "/v1/edit", files={"image": (None, "photo.png")}, data={"prompt": "x"}
+        )
+        self.assertEqual(response.status_code, 401)
+
+
+class TestImageCacheEviction(ApiTestCase):
+    env = {"IMAGE_CACHE_MB": "0.00002"}  # ~20 bytes: nothing will fit
+
+    def test_a_response_still_succeeds_when_nothing_fits(self):
+        response = self.post_edit(prompt="x")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        # inline bytes come from the request's own buffer, not the cache
+        self.assertIsNone(body["images"][0]["b64_json"])
+        self.assertFalse(body["images"][0]["retained"])
+
+    def test_the_image_endpoint_answers_410_once_evicted(self):
+        body = self.post_edit(prompt="x").json()
+        response = self.client.get(f"/v1/jobs/{body['id']}/image/0", headers=self.auth)
+        self.assertEqual(response.status_code, 410)
+        self.assertIn("no longer retained", response.json()["detail"])
+
+    def test_status_reports_that_the_image_is_gone(self):
+        body = self.post_edit(prompt="x").json()
+        status = self.client.get(f"/v1/jobs/{body['id']}", headers=self.auth).json()
+        self.assertEqual(status["status"], "succeeded")
+        self.assertFalse(status["images"][0]["retained"])
 
 
 class TestDeviceRegistry(ApiTestCase):

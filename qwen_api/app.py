@@ -19,10 +19,10 @@ import contextlib
 import hmac
 import mimetypes
 import os
+import re
 import time
 from collections import defaultdict, deque
 from fnmatch import fnmatch
-from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
@@ -45,6 +45,7 @@ from .schemas import (
     SampleParams,
     TunnelPublish,
 )
+from .storage import ComfyDirs
 from .workflows import ModelSpec
 
 API = "/v1"
@@ -75,9 +76,10 @@ CANDIDATES = {
     ],
 }
 
-store = JobStore(settings.output_dir, settings.job_ttl_hours)
+store = JobStore(settings.db_path, settings.job_ttl_hours, settings.image_cache_mb)
 comfy: ComfyClient | None = None
 registry = Registry(settings.mongodb_uri, settings.mongodb_collection, settings.host_name)
+storage = ComfyDirs.from_env()
 _spec_cache: dict[str, Any] = {"spec": None, "at": 0.0, "warnings": []}
 _hits: dict[str, deque[float]] = defaultdict(deque)
 _capacity_lock = asyncio.Lock()
@@ -94,7 +96,11 @@ def _client() -> ComfyClient:
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     global comfy
-    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    storage.ensure()
+    # Anything a previous crash left behind in ComfyUI's image directories.
+    removed = storage.sweep(settings.orphan_max_age_min * 60)
+    if removed:
+        print(f"[startup] removed {len(removed)} leftover image file(s)")
     _client()
     sweeper = asyncio.create_task(_sweep_loop())
     try:
@@ -164,6 +170,10 @@ def _rate_limited(token: str) -> str:
     return token
 
 
+# A name is only ever a bare filename inside ComfyUI's input directory.
+INPUT_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
 def check_capacity() -> None:
     if store.queue_length() >= settings.max_queue:
         raise HTTPException(
@@ -171,6 +181,77 @@ def check_capacity() -> None:
             detail=f"queue is full ({settings.max_queue} jobs); retry in a few seconds",
             headers={"Retry-After": "10"},
         )
+
+
+def check_request_size(request: Request) -> None:
+    """Reject an oversized body from Content-Length, before reading any of it.
+
+    Cloudflare answers an over-cap request with its own 413 page; catching it
+    here means the caller gets a message that says which limit to lower.
+    """
+    declared = request.headers.get("content-length")
+    if not declared or not declared.isdigit():
+        return
+    # + slack for the multipart boundaries and headers around the file parts.
+    if int(declared) > settings.max_request_bytes + 64 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=too_large(int(declared)),
+        )
+
+
+def too_large(size: int) -> str:
+    plan = "Cloudflare caps uploads at 100 MB on Free/Pro, 200 MB on Business"
+    return (
+        f"request body is {size / 1024 / 1024:.1f} MB; this service accepts "
+        f"{settings.max_request_mb:.0f} MB ({plan}). Send fewer/smaller images, "
+        f"use response_format=url, or reference a file already in "
+        f"ComfyUI/input/ by name instead of uploading it."
+    )
+
+
+async def read_capped(upload: UploadFile, budget: int) -> bytes:
+    """Read a part in chunks, giving up the moment the shared budget is gone."""
+    chunks: list[bytes] = []
+    used = 0
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        used += len(chunk)
+        if used > budget:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=too_large(used)
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def reference_existing_input(name: str) -> str:
+    """Use a file already in ComfyUI/input/ instead of uploading one.
+
+    This is the way past the tunnel's upload cap: put the file there yourself
+    (scp, a sync folder, anything) and send only its name. The name is
+    attacker-controlled text pointing at a server-side file, so it is matched
+    against a strict pattern and must exist.
+    """
+    candidate = name.strip()
+    if not INPUT_FILENAME.match(candidate) or ".." in candidate:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{name!r} is not a plain filename. Reference mode takes a bare "
+                "file name that already exists in ComfyUI/input/ "
+                "(letters, digits, dot, dash, underscore)."
+            ),
+        )
+    path = storage.resolve(candidate, "", "input")
+    if path is None or not path.is_file():
+        raise HTTPException(
+            status_code=400,
+            detail=f"{candidate!r} is not in ComfyUI's input directory ({storage.input})",
+        )
+    return candidate
 
 
 # --------------------------------------------------------------------------- #
@@ -293,7 +374,14 @@ def _graph(kind: str, spec: ModelSpec, params: dict[str, Any], names: list[str],
 
 
 async def _execute(kind: str, spec: ModelSpec, params: dict[str, Any], names: list[str],
-                   wait: bool, request: Request) -> Response:
+                   wait: bool, request: Request, response_format: str = "b64",
+                   uploaded: list[str] | None = None) -> Response:
+    """Queue a job and return its result.
+
+    `names` go into the graph. `uploaded` is the subset this service created and
+    must clean up - in reference mode `names` are files the caller put in
+    ComfyUI/input/ themselves, and those are never ours to delete.
+    """
     async with _capacity_lock:
         check_capacity()
         job = store.create(
@@ -308,42 +396,69 @@ async def _execute(kind: str, spec: ModelSpec, params: dict[str, Any], names: li
     async def work(job: Job) -> None:
         client = _client()
         saved: list[dict[str, Any]] = []
-        first_seed: int | None = None
-        for run in range(max(1, params["n"])):
-            seed = None if params["seed"] is None else params["seed"] + run
-            graph = _graph(kind, spec, params, names, f"{job.id}-{run}" if params["n"] > 1 else job.id, seed)
-            actual_seed = graph[workflows.SAMPLER]["inputs"]["seed"]
-            first_seed = first_seed if first_seed is not None else actual_seed
-            prompt_id = await client.queue_prompt(graph, client_id=job.id)
-            if run == 0:
-                store.update(job, comfy_prompt_id=prompt_id, seed=actual_seed)
-            record = await client.wait_for_result(
-                prompt_id, settings.job_timeout, settings.poll_interval
+        blobs: dict[int, bytes] = {}
+        try:
+            for run in range(max(1, params["n"])):
+                seed = None if params["seed"] is None else params["seed"] + run
+                graph = _graph(
+                    kind, spec, params, names,
+                    f"{job.id}-{run}" if params["n"] > 1 else job.id, seed,
+                )
+                prompt_id = await client.queue_prompt(graph, client_id=job.id)
+                if run == 0:
+                    store.update(
+                        job, comfy_prompt_id=prompt_id,
+                        seed=graph[workflows.SAMPLER]["inputs"]["seed"],
+                    )
+                record = await client.wait_for_result(
+                    prompt_id, settings.job_timeout, settings.poll_interval
+                )
+                failure = history_error(record)
+                if failure:
+                    raise RuntimeError(failure)
+                for meta in await client.fetch_outputs(record):
+                    index = len(saved)
+                    try:
+                        data = await client.view(
+                            meta["filename"], meta.get("subfolder", ""),
+                            meta.get("type", "output"),
+                        )
+                    finally:
+                        # The bytes are in RAM (or they never arrived); ComfyUI's
+                        # copy goes now either way, so a failed or crashed job
+                        # cannot leave a render behind.
+                        storage.unlink_quietly(
+                            storage.resolve(
+                                meta["filename"], meta.get("subfolder", ""),
+                                meta.get("type", "output"),
+                            )
+                        )
+                    saved.append(
+                        {
+                            "index": index,
+                            "filename": meta["filename"],
+                            "bytes": len(data),
+                            "media_type": mimetypes.guess_type(meta["filename"])[0]
+                            or "image/png",
+                            "retained": False,
+                        }
+                    )
+                    blobs[index] = data
+            if not saved:
+                raise RuntimeError("ComfyUI finished but produced no image")
+            store.update(
+                job, status=SUCCEEDED, images=saved,
+                duration=round(time.time() - job.created_at, 2),
             )
-            failure = history_error(record)
-            if failure:
-                raise RuntimeError(failure)
-            for meta in await client.fetch_outputs(record):
-                data = await client.view(
-                    meta["filename"], meta.get("subfolder", ""), meta.get("type", "output")
-                )
-                suffix = Path(meta["filename"]).suffix or ".png"
-                path = settings.output_dir / job.id / f"{len(saved)}{suffix}"
-                path.write_bytes(data)
-                saved.append(
-                    {
-                        "index": len(saved),
-                        "path": str(path),
-                        "filename": meta["filename"],
-                        "bytes": len(data),
-                        "media_type": mimetypes.guess_type(meta["filename"])[0] or "image/png",
-                    }
-                )
-        if not saved:
-            raise RuntimeError("ComfyUI finished but produced no image")
-        store.update(
-            job, status=SUCCEEDED, images=saved, duration=round(time.time() - job.created_at, 2)
-        )
+            # After the update, because it replaces `images` and therefore the
+            # `retained` flags that caching decides.
+            store.cache_images(job, blobs)
+        finally:
+            # Inputs *we* uploaded go when the job ends: succeeded, failed,
+            # cancelled or interrupted. A file the caller referenced by name is
+            # theirs and stays exactly where it is.
+            for name in uploaded or []:
+                storage.unlink_quietly(storage.resolve(name, "", "input"))
 
     await store.run(job, work)
     await asyncio.sleep(0)  # let the worker leave `queued`
@@ -351,7 +466,7 @@ async def _execute(kind: str, spec: ModelSpec, params: dict[str, Any], names: li
     if wait:
         if await store.wait(job, settings.sync_max_wait):
             if job.status == SUCCEEDED:
-                return _completed(job, request)
+                return _completed(job, request, response_format)
             raise HTTPException(status_code=502, detail=job.error or "job failed")
     return _accepted(job, request)
 
@@ -361,20 +476,32 @@ def _base_url(request: Request) -> str:
     return settings.public_base_url or str(request.base_url).rstrip("/")
 
 
-def _completed(job: Job, request: Request) -> Response:
+def _image_payload(job: Job, request: Request, response_format: str = "b64") -> list[dict[str, Any]]:
+    """Per-image response entries, read from RAM.
+
+    `retained` says whether the bytes are still in the cache, i.e. whether
+    `url` will still resolve. With response_format=b64 the bytes are inline, so
+    a cache miss only matters for a later fetch of the url.
+    """
     base = _base_url(request)
-    images = []
+    out: list[dict[str, Any]] = []
     for entry in job.images:
         index = entry.get("index", 0)
-        images.append(
-            {
-                "index": index,
-                "media_type": entry.get("media_type", "image/png"),
-                "bytes": entry.get("bytes"),
-                "url": f"{base}{API}/jobs/{job.id}/image/{index}",
-                "b64_json": base64.b64encode(Path(entry["path"]).read_bytes()).decode(),
-            }
-        )
+        payload: dict[str, Any] = {
+            "index": index,
+            "media_type": entry.get("media_type", "image/png"),
+            "bytes": entry.get("bytes"),
+            "url": f"{base}{API}/jobs/{job.id}/image/{index}",
+            "retained": bool(entry.get("retained")),
+        }
+        if response_format != "url":
+            blob = job.blob(index)
+            payload["b64_json"] = base64.b64encode(blob).decode() if blob else None
+        out.append(payload)
+    return out
+
+
+def _completed(job: Job, request: Request, response_format: str = "b64") -> Response:
     return JSONResponse(
         {
             "id": job.id,
@@ -382,7 +509,7 @@ def _completed(job: Job, request: Request) -> Response:
             "status": job.status,
             "seed": job.seed,
             "duration_s": job.duration,
-            "images": images,
+            "images": _image_payload(job, request, response_format),
         }
     )
 
@@ -419,6 +546,7 @@ def _job_status(job: Job) -> JobStatus:
                 "index": entry.get("index", 0),
                 "media_type": entry.get("media_type", "image/png"),
                 "bytes": entry.get("bytes"),
+                "retained": bool(entry.get("retained")),
                 "url": f"{API}/jobs/{job.id}/image/{entry.get('index', 0)}",
             }
             for entry in job.images
@@ -491,14 +619,21 @@ async def model_card() -> ModelCard:
 
 @app.post(f"{API}/generate", dependencies=[Depends(require_key)])
 async def generate(request: Request, body: GenerateRequest) -> Response:
+    check_request_size(request)
     spec, _ = await resolve_spec()
-    return await _execute("generate", spec, _params(body), [], body.wait is not False, request)
+    return await _execute(
+        "generate", spec, _params(body), [], body.wait is not False, request,
+        response_format=body.response_format or settings.response_format,
+    )
 
 
 @app.post(f"{API}/edit", dependencies=[Depends(require_key)])
 async def edit(
     request: Request,
-    image: Annotated[list[UploadFile], File(description="image(s) to edit")],
+    image: Annotated[
+        list[UploadFile | str],
+        File(description="image(s) to edit: a file, or the name of a file already in ComfyUI/input/"),
+    ],
     prompt: Annotated[str, Form()],
     negative_prompt: Annotated[str, Form()] = "",
     resolution: Annotated[int | None, Form()] = None,
@@ -511,9 +646,22 @@ async def edit(
     scheduler: Annotated[str | None, Form()] = None,
     wait: Annotated[bool | None, Form()] = None,
     n: Annotated[int, Form()] = 1,
+    response_format: Annotated[str | None, Form()] = None,
 ) -> Response:
+    check_request_size(request)
     if len(image) > settings.max_images:
-        raise HTTPException(status_code=400, detail=f"at most {settings.max_images} images per request")
+        raise HTTPException(
+            status_code=400, detail=f"at most {settings.max_images} images per request"
+        )
+    # Classify by what the part actually is. Note that FastAPI hands back
+    # starlette's UploadFile, which is NOT an instance of fastapi.UploadFile, so
+    # `isinstance(part, UploadFile)` is false for every real upload.
+    references = [item for item in image if isinstance(item, str)]
+    if references and len(references) != len(image):
+        raise HTTPException(
+            status_code=400,
+            detail="mixing uploads and filenames in one request is not supported",
+        )
     try:
         body = EditRequest(
             prompt=prompt,
@@ -528,6 +676,7 @@ async def edit(
             scheduler=scheduler,
             wait=wait,
             n=n,
+            response_format=response_format,
         )
     except ValidationError as exc:
         # The form is assembled by hand, so pydantic errors would otherwise
@@ -538,21 +687,39 @@ async def edit(
             status_code=422, detail=f"{field}: {first.get('msg')}" if field else first.get("msg", "")
         ) from exc
     check_capacity()  # reject before spending bandwidth on uploads
-    names: list[str] = []
-    for index, upload in enumerate(image):
-        data = await upload.read()
-        if len(data) > settings.max_upload_bytes:
-            raise HTTPException(
-                status_code=413, detail=f"{upload.filename} exceeds {settings.max_upload_mb:.0f}MB"
-            )
-        suffix = next((s for magic, s in IMAGE_MAGIC if data.startswith(magic)), None)
-        if suffix is None:
-            raise HTTPException(
-                status_code=415, detail=f"{upload.filename}: expected PNG or JPEG"
-            )
-        names.append(await _client().upload_image(data, f"qwen21_{index}{suffix}"))
+    # Resolve the model files *before* uploading: a 503 here would otherwise
+    # leave the uploaded files on disk with no job to clean them up.
     spec, _ = await resolve_spec()
-    return await _execute("edit", spec, _params(body), names, body.wait is not False, request)
+
+    names: list[str] = []
+    uploaded: list[str] = []
+    if references:
+        # Reference mode: nothing crosses the tunnel, so the upload cap is moot.
+        names = [reference_existing_input(item) for item in references]
+    else:
+        budget = settings.max_request_bytes
+        try:
+            for index, upload in enumerate(image):
+                data = await read_capped(upload, min(budget, settings.max_upload_bytes))
+                budget -= len(data)
+                suffix = next((s for magic, s in IMAGE_MAGIC if data.startswith(magic)), None)
+                if suffix is None:
+                    raise HTTPException(
+                        status_code=415,
+                        detail=f"{getattr(upload, 'filename', 'upload')}: expected PNG or JPEG",
+                    )
+                uploaded.append(await _client().upload_image(data, f"qwen21_{index}{suffix}"))
+                names.extend(uploaded[-1:])
+        except Exception:
+            # A part refused halfway through must not leave its predecessors.
+            for name in uploaded:
+                storage.unlink_quietly(storage.resolve(name, "", "input"))
+            raise
+    return await _execute(
+        "edit", spec, _params(body), names, body.wait is not False, request,
+        response_format=body.response_format or settings.response_format,
+        uploaded=uploaded,
+    )
 
 
 @app.get(f"{API}/jobs", response_model=JobList, dependencies=[Depends(require_key)])
@@ -576,8 +743,19 @@ async def job_image(job_id: str, index: int = 0) -> Response:
     entry = job.image(index)
     if entry is None:
         raise HTTPException(status_code=404, detail="no such image on this job")
+    blob = job.blob(index)
+    if blob is None:
+        # Images are held in RAM and nothing is written to disk, so once the
+        # cache has moved on (or the service restarted) there is nothing to give.
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=(
+                "image no longer retained: rendered images are kept in memory only "
+                "(IMAGE_CACHE_MB). Re-run with wait=true, or poll sooner."
+            ),
+        )
     return Response(
-        content=Path(entry["path"]).read_bytes(),
+        content=blob,
         media_type=entry.get("media_type", "image/png"),
         headers={"Cache-Control": "private, max-age=3600"},
     )
@@ -650,7 +828,12 @@ async def _sweep_loop() -> None:
         await asyncio.sleep(600)
         try:
             removed = await asyncio.to_thread(store.sweep)
+            orphans = await asyncio.to_thread(
+                storage.sweep, settings.orphan_max_age_min * 60
+            )
             if removed:
                 print(f"[sweeper] removed {removed} expired job(s)")
+            if orphans:
+                print(f"[sweeper] removed {len(orphans)} leftover image file(s)")
         except Exception as exc:  # housekeeping must never kill the service
             print(f"[sweeper] {exc}")
